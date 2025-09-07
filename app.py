@@ -119,6 +119,26 @@ def ensure_event_loop() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
+# ==== Neu: PLAN_SPEC aus un-fenced JSON am Textanfang herausfiltern ===========
+def _strip_leading_plan_spec(text: str) -> Tuple[str, Optional[dict]]:
+    """
+    Entfernt ein am Textanfang stehendes JSON-Objekt, wenn es wie eine PLAN_SPEC aussieht.
+    Gibt (bereinigter_text, planspec_dict|None) zurück.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return text, None
+    m = re.match(r'^\s*(\{.*?\})\s*(?:\n|$)', text, flags=re.DOTALL)
+    if not m:
+        return text, None
+    blob = m.group(1)
+    try:
+        obj = json.loads(blob)
+        # _looks_like_plan_spec ist weiter unten definiert; wir verwenden Late-Bindung.
+        # Wir prüfen defensiv erst später im Code, falls die Funktion noch nicht im Scope ist.
+        return text[m.end():].lstrip(), obj
+    except Exception:
+        return text, None
+
 # ===== Earth Engine (Host-Init) ===============================================
 EE_OK = True
 try:
@@ -377,8 +397,6 @@ def _extract_plan_spec_from_text(answer_text: str) -> Tuple[Optional[dict], str]
     return None, text
 
 # ===== Agent Setup + persistente SDK-Session ==================================
-
-# --- NEU: strukturiertes Output-Schema des Haupt-Agenten ----------------------
 class MainOutputs:
     def __init__(self,
                  plan_spec: Optional[Dict[str, Any]] = None,
@@ -393,7 +411,7 @@ if AGENTS_OK:
         instructions=MEGA_PROMPT,
         tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python],
         model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
-        output_type=MainOutputs,  # <<< NEU: strukturierte Ausgaben (plan_spec, code)
+        output_type=MainOutputs,  # strukturierte Ausgaben (plan_spec, code)
     )
 else:
     agent = None
@@ -546,6 +564,8 @@ if "skip_agent_on_next_run" not in st.session_state:
     st.session_state.skip_agent_on_next_run = False
 if "queued_input" not in st.session_state:
     st.session_state.queued_input = None
+if "_runner_autorun_done" not in st.session_state:
+    st.session_state._runner_autorun_done = False
 
 # Guardeter UI-ReRun: UI-Repaint ohne neuen Agent-Call
 ui_only_rerun = False
@@ -599,7 +619,7 @@ if prompt and not ui_only_rerun:
     # ===== Sichtbarer Text (ohne Code) & strukturierte Outputs bevorzugen =====
     out = getattr(result, "final_output", None)
 
-    # Sichtbarer Text aus bekannten Feldern beziehen; Fallbacks zulassen
+    # Sichtbaren Text holen (versch. Felder), dann PLAN_SPEC-JSON am Anfang ggf. entfernen
     visible_text = ""
     for attr in ("text", "final_output_text", "message", "output_text"):
         v = getattr(result, attr, None)
@@ -609,25 +629,35 @@ if prompt and not ui_only_rerun:
     if isinstance(out, str) and not visible_text:
         visible_text = out
 
-    # PLAN_SPEC / CODE strukturiert lesen
+    # Erst un-fenced JSON am Anfang entfernen (mögliche PLAN_SPEC-Leak)
+    visible_text, leading_obj = _strip_leading_plan_spec(visible_text)
+    try:
+        if leading_obj is not None and _looks_like_plan_spec(leading_obj):
+            st.session_state["last_plan_spec"] = leading_obj
+    except Exception:
+        pass
+
+    # Danach nochmals: PLAN_SPEC aus fenced-JSON entfernen (Fallback)
+    extracted, cleaned_text = _extract_plan_spec_from_text(visible_text)
+    if extracted is not None and _looks_like_plan_spec(extracted):
+        st.session_state["last_plan_spec"] = extracted
+        visible_text = cleaned_text
+
+    # PLAN_SPEC / CODE strukturiert lesen (bevor wir rendern)
     plan_spec_obj = None
     code_out = None
     if out is not None:
         plan_spec_obj = getattr(out, "plan_spec", None)
         code_out = getattr(out, "code", None)
-
-    # ggf. weitere Kanäle (named outputs / dict)
     if plan_spec_obj is None and hasattr(result, "outputs") and isinstance(result.outputs, dict):
         plan_spec_obj = result.outputs.get("plan_spec", None)
     if code_out is None and hasattr(result, "outputs") and isinstance(result.outputs, dict):
         code_out = result.outputs.get("code", None)
-
-    # Als letzte Option: PLAN_SPEC aus sichtbarem Text extrahieren
-    if plan_spec_obj is None and isinstance(visible_text, str):
-        extracted, cleaned_text = _extract_plan_spec_from_text(visible_text)
-        if extracted:
-            plan_spec_obj = extracted
-            visible_text = cleaned_text
+    try:
+        if plan_spec_obj is not None and _looks_like_plan_spec(plan_spec_obj):
+            st.session_state["last_plan_spec"] = plan_spec_obj
+    except Exception:
+        pass
 
     # 3) Assistant-Antwort rendern (Codefences ausblenden)
     ui_answer = strip_fenced_code_blocks(visible_text or "")
@@ -636,16 +666,8 @@ if prompt and not ui_only_rerun:
     st.session_state.messages.append({"role": "assistant", "content": ui_answer})
     st.session_state["last_assistant_text"] = ui_answer
 
-    # PLAN_SPEC intern merken (unsichtbar)
-    try:
-        if plan_spec_obj is not None and _looks_like_plan_spec(plan_spec_obj):
-            st.session_state["last_plan_spec"] = plan_spec_obj
-    except Exception:
-        pass
-
     # 4) Code → Self-Heal → Auto-Ausführen (silent). Struktur bevorzugt; Fallback: Markdown-Parsing
     if not isinstance(code_out, str) or not code_out.strip():
-        # Fallback auf Markdown-Codeblock nur, wenn kein strukturiertes "code" kam
         code_out = extract_first_python_block(visible_text or "")
 
     if isinstance(code_out, str) and code_out.strip():
@@ -657,33 +679,33 @@ if prompt and not ui_only_rerun:
             try:
                 compiled = compile(final_code, "<visible>", "exec")
                 exec(compiled, ns, ns)
-                # Direkt im Anschluss: Runner (script) automatisch starten
+                # Direkt im Anschluss: Runner (script) automatisch starten (einmalig)
                 _resp = _tool_run_python_impl(final_code, mode="script")
                 try:
                     res = json.loads(_resp) if isinstance(_resp, str) else _resp
                 except Exception:
                     res = {"ok": False, "stderr": "Runner response decode failed."}
-                if not res.get("ok"):
+                if res.get("ok"):
+                    st.session_state._runner_autorun_done = True
+                    st.sidebar.caption("Code ausgeführt • Runner erfolgreich ausgeführt.")
+                else:
                     # Ein zusätzlicher Fixer-Versuch mit Runner-stderr
                     runner_err = res.get("stderr", "")
                     patched = _sh_fix_code_once(final_code, runner_err) if runner_err else None
                     if patched and patched.strip() != final_code.strip():
-                        # erneut in-process testen
                         try:
                             compiled2 = compile(patched, "<visible>", "exec")
                             exec(compiled2, ns, ns)
-                            # und erneut Runner
                             _resp2 = _tool_run_python_impl(patched, mode="script")
                             res2 = json.loads(_resp2) if isinstance(_resp2, str) else _resp2
                             if res2.get("ok"):
+                                st.session_state._runner_autorun_done = True
                                 st.sidebar.caption("Runner erfolgreich nach Auto-Fix.")
                                 st.session_state.last_code = patched
                             else:
                                 st.sidebar.warning("Runner-Fehler blieb bestehen (siehe Logs im Backend).")
                         except Exception:
                             st.sidebar.warning("Auto-Fix nach Runner-Fehler schlug fehl.")
-                else:
-                    st.sidebar.caption("Code ausgeführt • Runner erfolgreich ausgeführt.")
             except Exception:
                 st.error("Es gab einen Ausführungsfehler. Ich konnte ihn nicht automatisch beheben.")
                 st.caption("Hinweis: Details sind intern protokolliert.")
@@ -694,5 +716,20 @@ if prompt and not ui_only_rerun:
     # Nach Abschluss: Buttons sofort neu rendern → UI-only Re-Run
     st.session_state["skip_agent_on_next_run"] = True
     st.rerun()
+
+# ===== Auto-Re-Render nach Re-Run (kein Prompt aktiv) =========================
+# Wenn kein Prompt verarbeitet wird (erstes Laden oder UI-only ReRun),
+# rendere die letzte App erneut und starte den Runner genau einmal automatisch.
+if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
+    try:
+        ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
+        compiled = compile(st.session_state.last_code, "<autorender>", "exec")
+        exec(compiled, ns, ns)
+        if not st.session_state._runner_autorun_done:
+            _ = _tool_run_python_impl(st.session_state.last_code, mode="script")
+            st.session_state._runner_autorun_done = True
+            st.sidebar.caption("Runner automatisch gestartet.")
+    except Exception:
+        st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
