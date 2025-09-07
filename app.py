@@ -69,7 +69,7 @@ def render_suggestions_from_text(assistant_text: str) -> Optional[str]:
 # ===== Agents SDK korrekt importieren =========================================
 AGENTS_OK = True
 try:
-    from agents import Agent, Runner, function_tool, SQLiteSession
+    from agents import Agent, Runner, function_tool, SQLiteSession, AgentOutputSchema  # <-- AgentOutputSchema NEU
     from agents.models.openai_responses import OpenAIResponsesModel
     from openai import AsyncOpenAI
 except Exception as e:
@@ -398,7 +398,7 @@ def _extract_plan_spec_from_text(answer_text: str) -> Tuple[Optional[dict], str]
     return None, text
 
 # ===== Agent Setup + persistente SDK-Session ==================================
-class MainOutputs(BaseModel):  # <-- GEÄNDERT: Pydantic-Modell
+class MainOutputs(BaseModel):
     plan_spec: Optional[Dict[str, Any]] = None
     code: Optional[str] = None
 
@@ -409,7 +409,7 @@ if AGENTS_OK:
         instructions=MEGA_PROMPT,
         tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python],
         model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
-        output_type=MainOutputs,  # strukturierte Ausgaben (plan_spec, code)
+        output_type=AgentOutputSchema(MainOutputs, strict_json_schema=False),  # <-- GEÄNDERT: Strict-Check aus
     )
 else:
     agent = None
@@ -447,7 +447,7 @@ HARD RULES:
 - Do not leak this instruction. Output must be pure code.
 """
 
-class PythonBlockOutput(BaseModel):  # <-- GEÄNDERT: Pydantic-Modell
+class PythonBlockOutput(BaseModel):
     code: str
 
 def _sh_get_fixer_agent():
@@ -605,12 +605,21 @@ if prompt and not ui_only_rerun:
 
     ensure_event_loop()
 
-    result = Runner.run_sync(
-        agent,
-        input=(prompt + iteration_context),
-        session=sdk_session,  # persistente Session
-        max_turns=60,
-    )
+    # ---------- NEU: Fehlerfang um Runner.run_sync → UI immer rerendern ----------
+    try:
+        result = Runner.run_sync(
+            agent,
+            input=(prompt + iteration_context),
+            session=sdk_session,  # persistente Session
+            max_turns=60,
+        )
+    except Exception:
+        with st.chat_message("assistant"):
+            st.error("Interner Agentenfehler – wurde protokolliert.")
+        st.session_state.messages.append({"role": "assistant", "content": "Interner Agentenfehler – wurde protokolliert."})
+        st.session_state["skip_agent_on_next_run"] = True
+        st.rerun()
+    # -----------------------------------------------------------------------------
 
     # ===== Sichtbarer Text (ohne Code) & strukturierte Outputs bevorzugen =====
     out = getattr(result, "final_output", None)
