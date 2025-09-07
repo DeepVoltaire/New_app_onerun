@@ -68,7 +68,7 @@ def render_suggestions_from_text(assistant_text: str) -> Optional[str]:
 # ===== Agents SDK korrekt importieren =========================================
 AGENTS_OK = True
 try:
-    from agents import Agent, Runner, function_tool, SQLiteSession
+    from agents import Agent, Runner, function_tool, SQLiteSession, AgentOutputSchema
     from agents.models.openai_responses import OpenAIResponsesModel
     from openai import AsyncOpenAI
 except Exception as e:
@@ -133,8 +133,6 @@ def _strip_leading_plan_spec(text: str) -> Tuple[str, Optional[dict]]:
     blob = m.group(1)
     try:
         obj = json.loads(blob)
-        # _looks_like_plan_spec ist weiter unten definiert; wir verwenden Late-Bindung.
-        # Wir prüfen defensiv erst später im Code, falls die Funktion noch nicht im Scope ist.
         return text[m.end():].lstrip(), obj
     except Exception:
         return text, None
@@ -397,14 +395,20 @@ def _extract_plan_spec_from_text(answer_text: str) -> Tuple[Optional[dict], str]
     return None, text
 
 # ===== Agent Setup + persistente SDK-Session ==================================
+# Structured Output NUR für plan_spec
 if AGENTS_OK:
+    from pydantic import BaseModel
+
+    class PlanSpecOnly(BaseModel):
+        plan_spec: Optional[Dict[str, Any]] = None
+
     openai_client = AsyncOpenAI()  # nutzt OPENAI_API_KEY
     agent = Agent(
         name="EO-Agent",
         instructions=MEGA_PROMPT,
         tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python],
         model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
-        # WICHTIG: KEIN output_type → nur plan_spec wird als Structured Output genutzt
+        output_type=AgentOutputSchema(PlanSpecOnly, strict_json_schema=False),  # NUR plan_spec als structured output
     )
 else:
     agent = None
@@ -498,7 +502,10 @@ def _sh_fix_code_once(code_text: str, error_log: str) -> Optional[str]:
         return None
 
 def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
-    ...
+    buf = _sh_io.StringIO()
+    _stdout = _sh_sys.stdout
+    _stderr = _sh_sys.stderr
+    ok = False
     try:
         _sh_sys.stdout = buf
         _sh_sys.stderr = buf
@@ -506,14 +513,13 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
         compiled = compile(code_text, "<healed>", "exec")
         exec(compiled, ns, ns)
         ok = True
-    except BaseException as e:  # <— wichtig: Stop/Rerun werden gefangen
+    except BaseException as e:  # Stop/Rerun werden gefangen, Fixer kann triggern
         out = buf.getvalue() + f"\nERROR({e.__class__.__name__}): {e!r}"
         return False, out
     finally:
         _sh_sys.stdout = _stdout
         _sh_sys.stderr = _stderr
     return ok, buf.getvalue()
-
 
 def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str, List[str]]:
     logs: List[str] = []
@@ -638,12 +644,10 @@ if prompt and not ui_only_rerun:
     plan_spec_obj = None
     code_out = None
     if out is not None:
+        # out kann eine Instanz von PlanSpecOnly sein
         plan_spec_obj = getattr(out, "plan_spec", None)
-        code_out = getattr(out, "code", None)
     if plan_spec_obj is None and hasattr(result, "outputs") and isinstance(result.outputs, dict):
         plan_spec_obj = result.outputs.get("plan_spec", None)
-    if code_out is None and hasattr(result, "outputs") and isinstance(result.outputs, dict):
-        code_out = result.outputs.get("code", None)
     try:
         if plan_spec_obj is not None and _looks_like_plan_spec(plan_spec_obj):
             st.session_state["last_plan_spec"] = plan_spec_obj
@@ -723,7 +727,4 @@ if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
-
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
-
-
