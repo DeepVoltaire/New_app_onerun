@@ -147,21 +147,51 @@ except Exception:
 def ee_maybe_init() -> bool:
     if not EE_OK:
         return False
+    # Bereits initialisiert?
     try:
         ee.Number(1).getInfo()
         return True
     except Exception:
-        try:
-            sa = st.secrets.get("EE_SERVICE_ACCOUNT")
-            key = st.secrets.get("EE_PRIVATE_KEY")
-            proj = st.secrets.get("EE_PROJECT")
-            if sa and key and proj:
-                credentials = ee.ServiceAccountCredentials(sa, key)
-                ee.Initialize(credentials=credentials, project=proj)
-                ee.Number(1).getInfo()
-                return True
-        except Exception:
-            pass
+        pass
+    # Init via Streamlit-Secrets (Service Account)
+    try:
+        sa = st.secrets.get("EE_SERVICE_ACCOUNT")
+        key = st.secrets.get("EE_PRIVATE_KEY")
+        proj = st.secrets.get("EE_PROJECT")
+        if not (sa and key and proj):
+            return False
+
+        # Schlüsselmaterial tolerant verarbeiten (dict oder JSON-String)
+        import json as _json
+        key_json_str: Optional[str] = None
+        if isinstance(key, dict):
+            key_json_str = _json.dumps(key)
+        elif isinstance(key, str) and key.strip():
+            key_json_str = key.strip()
+
+        if key_json_str and key_json_str.startswith("{"):
+            # Direkt aus JSON-Inhalt Credentials bauen
+            from google.oauth2 import service_account as _sa_mod
+            scopes = [
+                "https://www.googleapis.com/auth/earthengine",
+                "https://www.googleapis.com/auth/devstorage.read_only",
+            ]
+            creds = _sa_mod.Credentials.from_service_account_info(_json.loads(key_json_str), scopes=scopes)
+            ee.Initialize(credentials=creds, project=proj)
+        else:
+            # Fallback: in Temp-Datei schreiben und klassisch initialisieren
+            import tempfile as _tf
+            with _tf.NamedTemporaryFile("w", delete=False, suffix=".json") as fp:
+                if key_json_str:
+                    fp.write(key_json_str)
+                key_path = fp.name
+            creds = ee.ServiceAccountCredentials(sa, key_path)
+            ee.Initialize(credentials=creds, project=proj)
+
+        # Health-Check
+        ee.Number(1).getInfo()
+        return True
+    except Exception:
         return False
 
 _EE_READY = ee_maybe_init()
@@ -259,16 +289,39 @@ def _tool_run_python_impl(code: str,
     # Prelude injizieren: EE-Init im Subprozess (Service Account via ENV)
     ee_prelude = (
         "try:\n"
-        "    import os, ee\n"
+        "    import os, ee, json, tempfile\n"
         "    _sa=os.environ.get('EE_SERVICE_ACCOUNT')\n"
         "    _key=os.environ.get('EE_PRIVATE_KEY')\n"
         "    _proj=os.environ.get('EE_PROJECT')\n"
         "    if _sa and _key and _proj:\n"
-        "        credentials=ee.ServiceAccountCredentials(_sa, _key)\n"
-        "        ee.Initialize(credentials=credentials, project=_proj)\n"
+        "        try:\n"
+        "            from google.oauth2 import service_account as _sa_mod\n"
+        "            scopes=[\n"
+        "                'https://www.googleapis.com/auth/earthengine',\n"
+        "                'https://www.googleapis.com/auth/devstorage.read_only',\n"
+        "            ]\n"
+        "            _key_str=_key.strip() if isinstance(_key, str) else _key\n"
+        "            if isinstance(_key_str, str) and _key_str.startswith('{'):\n"
+        "                creds=_sa_mod.Credentials.from_service_account_info(json.loads(_key_str), scopes=scopes)\n"
+        "                ee.Initialize(credentials=creds, project=_proj)\n"
+        "            else:\n"
+        "                with tempfile.NamedTemporaryFile('w', delete=False, suffix='.json') as fp:\n"
+        "                    fp.write(_key_str if isinstance(_key_str, str) else str(_key_str))\n"
+        "                    key_path=fp.name\n"
+        "                creds=ee.ServiceAccountCredentials(_sa, key_path)\n"
+        "                ee.Initialize(credentials=creds, project=_proj)\n"
+        "        except Exception:\n"
+        "            try:\n"
+        "                with tempfile.NamedTemporaryFile('w', delete=False, suffix='.json') as fp:\n"
+        "                    fp.write(_key if isinstance(_key, str) else str(_key))\n"
+        "                    key_path=fp.name\n"
+        "                creds=ee.ServiceAccountCredentials(_sa, key_path)\n"
+        "                ee.Initialize(credentials=creds, project=_proj)\n"
+        "            except Exception:\n"
+        "                ee.Initialize()\n"
         "    else:\n"
         "        ee.Initialize()\n"
-        "except Exception as _e:\n"
+        "except Exception:\n"
         "    pass\n\n"
     )
     code_with_prelude = ee_prelude + (code or "")
@@ -285,9 +338,9 @@ def _tool_run_python_impl(code: str,
         key = st.secrets.get("EE_PRIVATE_KEY")
         proj = st.secrets.get("EE_PROJECT")
         if sa and key and proj:
-            env["EE_SERVICE_ACCOUNT"] = sa
-            env["EE_PRIVATE_KEY"] = key
-            env["EE_PROJECT"] = proj
+            env["EE_SERVICE_ACCOUNT"] = str(sa)
+            env["EE_PRIVATE_KEY"] = key if isinstance(key, str) else json.dumps(key)
+            env["EE_PROJECT"] = str(proj)
     except Exception:
         pass
 
@@ -395,7 +448,6 @@ def _extract_plan_spec_from_text(answer_text: str) -> Tuple[Optional[dict], str]
     return None, text
 
 # ===== Agent Setup + persistente SDK-Session ==================================
-# Structured Output NUR für plan_spec
 if AGENTS_OK:
     from pydantic import BaseModel
 
@@ -408,7 +460,7 @@ if AGENTS_OK:
         instructions=MEGA_PROMPT,
         tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python],
         model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
-        output_type=AgentOutputSchema(PlanSpecOnly, strict_json_schema=False),  # NUR plan_spec als structured output
+        output_type=AgentOutputSchema(PlanSpecOnly, strict_json_schema=False),  # nur plan_spec
     )
 else:
     agent = None
@@ -432,7 +484,6 @@ import io as _sh_io
 
 DEFAULT_MAX_TURNS = 12
 
-# ---- Fixer-Konstante & Output-Hülle VOR Verwendung definieren ----------------
 _SH_FIXER_PROMPT = """
 You are AGENT 2 (Fixer). Return ONLY a single, fully runnable Python file. No prose. No explanations.
 INTERNAL MANDATE (do not output):
@@ -644,7 +695,6 @@ if prompt and not ui_only_rerun:
     plan_spec_obj = None
     code_out = None
     if out is not None:
-        # out kann eine Instanz von PlanSpecOnly sein
         plan_spec_obj = getattr(out, "plan_spec", None)
     if plan_spec_obj is None and hasattr(result, "outputs") and isinstance(result.outputs, dict):
         plan_spec_obj = result.outputs.get("plan_spec", None)
@@ -713,8 +763,6 @@ if prompt and not ui_only_rerun:
     st.rerun()
 
 # ===== Auto-Re-Render nach Re-Run (kein Prompt aktiv) =========================
-# Wenn kein Prompt verarbeitet wird (erstes Laden oder UI-only ReRun),
-# rendere die letzte App erneut und starte den Runner genau einmal automatisch.
 if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
     try:
         ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
