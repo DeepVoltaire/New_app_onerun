@@ -245,6 +245,14 @@ def _tool_run_python_impl(code: str,
     py = sys.executable
     env = os.environ.copy()
 
+    # WICHTIG: Repo-Root in den Importpfad für den Subprozess legen,
+    # damit 'import blocks....' funktioniert.
+    existing_pp = env.get("PYTHONPATH", "")
+    parts = [str(BASE_DIR)]
+    if existing_pp:
+        parts.append(existing_pp)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+
     if mode == "script":
         try:
             proc = subprocess.run(
@@ -253,7 +261,7 @@ def _tool_run_python_impl(code: str,
                 capture_output=True,
                 text=True,
                 timeout=timeout_sec,
-                env=env
+                env=env,  # <--- PYTHONPATH gesetzt
             )
             return json.dumps({
                 "ok": proc.returncode == 0,
@@ -280,7 +288,7 @@ def _tool_run_python_impl(code: str,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                env=env
+                env=env,  # <--- PYTHONPATH gesetzt
             )
             try:
                 bootstrap = proc.stdout.readline().strip() if proc.stdout else ""
@@ -305,6 +313,7 @@ def _tool_run_python_impl(code: str,
             }, ensure_ascii=False)
 
     return json.dumps({"error": f"unknown mode '{mode}'"})
+
 
 # Für den Agenten als Tool registrieren:
 tool_run_python = function_tool(_tool_run_python_impl)
@@ -629,3 +638,4 @@ if code_str:
         if res.get("ok") and res.get("url"):
             st.info("Hinweis: Auf Cloud-Hosts ist die zweite Streamlit-Instanz in der Regel nicht erreichbar.")
             st.success(f"Lokale URL (falls lokal ausgeführt): {res['url']}  (PID: {res.get('pid')})")
+
