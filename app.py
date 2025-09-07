@@ -713,16 +713,17 @@ if prompt and not ui_only_rerun:
 # rendere die letzte App erneut und starte den Runner genau einmal automatisch.
 if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
     try:
-    ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
-    compiled = compile(st.session_state.last_code, "<autorender>", "exec")
-    exec(compiled, ns, ns)
-    if not st.session_state._runner_autorun_done:
-        _ = _tool_run_python_impl(st.session_state.last_code, mode="script")
-        st.session_state._runner_autorun_done = True
-        st.sidebar.caption("Runner automatisch gestartet.")
+        ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
+        compiled = compile(st.session_state.last_code, "<autorender>", "exec")
+        exec(compiled, ns, ns)
+        if not st.session_state._runner_autorun_done:
+            _ = _tool_run_python_impl(st.session_state.last_code, mode="script")
+            st.session_state._runner_autorun_done = True
+            st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
+
 
