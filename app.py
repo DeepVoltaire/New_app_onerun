@@ -189,6 +189,39 @@ def tool_get_uc_sections(uc_id: str, sections: List[str]) -> str:
             out[sec] = data[sec]
     return _safe_json(out)
 
+# ---- WIEDERHERGESTELLT: tool_bundle_components -------------------------------
+@function_tool
+def tool_bundle_components(components: List[str]) -> str:
+    """
+    Lädt mehrere Komponenten und liefert:
+    {
+      "bundle": "<concatenated files mit BEGIN/END headers>",
+      "manifest": [{"id": path, "sha1": "...", "bytes": N}, ...]
+    }
+    """
+    bundle_parts: List[str] = []
+    manifest: List[Dict[str, Any]] = []
+
+    LEGACY_DIR = BASE_DIR / "blocks" / "components" / "legacy"
+
+    for rel in components or []:
+        p = (BASE_DIR / rel).resolve()
+        if not str(p).startswith(str(BASE_DIR)):
+            return _safe_json({"error": f"component outside repo scope: {rel}"})
+        if LEGACY_DIR in p.parents or p.name.startswith("fs_"):
+            return _safe_json({"error": f"legacy component not allowed: {rel}"})
+        if not p.exists():
+            return _safe_json({"error": f"component not found: {rel}"})
+
+        txt = p.read_text(encoding="utf-8")
+        h = _sha1_text(txt)
+        header = f"\n# ==== BEGIN COMPONENT: {rel} (sha1:{h}) ====\n"
+        footer = f"\n# ==== END COMPONENT: {rel} ====\n"
+        bundle_parts.append(header + txt + footer)
+        manifest.append({"id": rel, "sha1": h, "bytes": len(txt.encode("utf-8"))})
+
+    return _safe_json({"bundle": "\n".join(bundle_parts), "manifest": manifest})
+
 # --- HINWEIS: tool_run_python als interne Implementierung + Tool-Wrapper -----
 def _tool_run_python_impl(code: str,
                           filename: Optional[str] = None,
