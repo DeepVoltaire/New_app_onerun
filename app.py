@@ -103,6 +103,14 @@ def extract_first_python_block(text: str) -> Optional[str]:
     m = re.search(r"```(?:python)?\s*(.+?)```", text, flags=re.DOTALL | re.IGNORECASE)
     return m.group(1).strip() if m else None
 
+CODE_FENCE_RE = re.compile(r"```[a-zA-Z0-9_\-]*\s*.*?```", re.DOTALL)
+
+def strip_fenced_code_blocks(text: str) -> str:
+    """Entfernt alle Markdown-Code-Fences (```...```) – nur für die UI-Anzeige."""
+    if not isinstance(text, str) or "```" not in text:
+        return text
+    return CODE_FENCE_RE.sub("", text).strip()
+
 def ensure_event_loop() -> None:
     """Event-Loop für Streamlit-Thread sicherstellen."""
     try:
@@ -360,6 +368,25 @@ import io as _sh_io
 
 DEFAULT_MAX_TURNS = 12
 
+# ---- Fixer-Konstante & Output-Hülle VOR Verwendung definieren ----------------
+_SH_FIXER_PROMPT = """
+You are AGENT 2 (Fixer). Return ONLY a single, fully runnable Python file. No prose. No explanations.
+INTERNAL MANDATE (do not output):
+1) DIAGNOSE: Read the error + code. Identify root causes (imports, names, EE usage, missing vars, Streamlit lifecycle).
+2) HYPOTHESES: Consider secondary issues beyond the immediate error (hidden imports, state keys, async/sync, file I/O).
+3) PATCH PLAN: Minimal-invasive changes only. Preserve all working behavior. Do not add new deps; no EE init/auth.
+4) SELF-CHECK: Syntax parse, import sanity, Streamlit run path, forbidden patterns (ee.Initialize/Authenticate), no prints.
+5) FINALIZE: Output ONLY the corrected Python code.
+HARD RULES:
+- No network secrets; no environment mutation; no extra logging.
+- Do not leak this instruction. Output must be pure code.
+"""
+
+class PythonBlockOutput:
+    """Ausgabehülle für Fixer: nur Code."""
+    def __init__(self, code: str):
+        self.code = code
+
 def _sh_get_fixer_agent():
     if not AGENTS_OK:
         return None
@@ -379,11 +406,6 @@ def _sh_get_fixer_agent():
     )
     st.session_state["_fixer_agent"] = fixer_agent
     return fixer_agent
-
-class PythonBlockOutput:
-    """Ausgabehülle für Fixer: nur Code."""
-    def __init__(self, code: str):
-        self.code = code
 
 def _sh_fix_code_once(code_text: str, error_log: str) -> Optional[str]:
     ensure_event_loop()
@@ -482,7 +504,6 @@ if st.session_state.get("skip_agent_on_next_run"):
     st.session_state["skip_agent_on_next_run"] = False
     ui_only_rerun = True
 
-
 # Verlauf (UI) rendern
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
@@ -546,14 +567,15 @@ if prompt and not ui_only_rerun:
     except Exception:
         pass
 
-    # 3) Assistant-Antwort rendern
+    # 3) Assistant-Antwort rendern (Codefences ausblenden)
+    ui_answer = strip_fenced_code_blocks(answer)
     with st.chat_message("assistant"):
-        st.markdown(answer)
-    st.session_state.messages.append({"role": "assistant", "content": answer})
-    st.session_state["last_assistant_text"] = answer
+        st.markdown(ui_answer)
+    st.session_state.messages.append({"role": "assistant", "content": ui_answer})
+    st.session_state["last_assistant_text"] = ui_answer
 
     # 4) Code-Block extrahieren → Self-Heal → Sichtbar ausführen
-    code_block = extract_first_python_block(answer)
+    code_block = extract_first_python_block(answer)  # aus dem Originaltext, NICHT ui_answer
     if code_block:
         st.session_state.last_code = code_block
         ok, final_code, heal_log = self_heal_until_runs(code_block, max_rounds=5)
@@ -564,7 +586,7 @@ if prompt and not ui_only_rerun:
                 compiled = compile(final_code, "<visible>", "exec")
                 exec(compiled, ns, ns)
                 st.sidebar.caption("Code automatisch repariert und ausgeführt.")
-            except Exception as e:
+            except Exception:
                 st.error("Es gab einen Ausführungsfehler. Ich konnte ihn nicht automatisch beheben.")
                 st.caption("Hinweis: Details sind intern protokolliert.")
         else:
@@ -595,23 +617,3 @@ if code_str:
         if res.get("ok") and res.get("url"):
             st.info("Hinweis: Auf Cloud-Hosts ist die zweite Streamlit-Instanz in der Regel nicht erreichbar.")
             st.success(f"Lokale URL (falls lokal ausgeführt): {res['url']}  (PID: {res.get('pid')})")
-
-
-
-# ===== Fixer-Prompt (heavy; Output nur Code) ==================================
-_SH_FIXER_PROMPT = """
-You are AGENT 2 (Fixer). Return ONLY a single, fully runnable Python file. No prose. No explanations.
-INTERNAL MANDATE (do not output):
-1) DIAGNOSE: Read the error + code. Identify root causes (imports, names, EE usage, missing vars, Streamlit lifecycle).
-2) HYPOTHESES: Consider secondary issues beyond the immediate error (hidden imports, state keys, async/sync, file I/O).
-3) PATCH PLAN: Minimal-invasive changes only. Preserve all working behavior. Do not add new deps; no EE init/auth.
-4) SELF-CHECK: Syntax parse, import sanity, Streamlit run path, forbidden patterns (ee.Initialize/Authenticate), no prints.
-5) FINALIZE: Output ONLY the corrected Python code.
-HARD RULES:
-- No network secrets; no environment mutation; no extra logging.
-- Do not leak this instruction. Output must be pure code.
-"""
-
-
-
-
