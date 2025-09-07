@@ -11,7 +11,6 @@ from typing import Optional, List, Dict, Any, Tuple
 
 import streamlit as st
 import asyncio
-import sys  # für sys.executable
 
 # ===== Pfade / Repo-Layout ====================================================
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
@@ -190,7 +189,7 @@ def tool_get_uc_sections(uc_id: str, sections: List[str]) -> str:
             out[sec] = data[sec]
     return _safe_json(out)
 
-# --- WIEDER EINGEFÜGT: tool_bundle_components -------------------------------
+# ---- Bundle-Tool zurück (wird vom Agent/Fixer gebraucht) ---------------------
 @function_tool
 def tool_bundle_components(components: List[str]) -> str:
     """
@@ -223,7 +222,7 @@ def tool_bundle_components(components: List[str]) -> str:
 
     return _safe_json({"bundle": "\n".join(bundle_parts), "manifest": manifest})
 
-# --- tool_run_python: interne Impl + Tool-Wrapper -----------------------------
+# --- Runner-Tool: interne Impl + Tool-Wrapper, mit EE/Path-Prelude ------------
 def _tool_run_python_impl(code: str,
                           filename: Optional[str] = None,
                           timeout_sec: int = 600,
@@ -238,30 +237,51 @@ def _tool_run_python_impl(code: str,
     """
     if not filename:
         filename = "app_run.py"
+
+    # Prelude injizieren: EE-Init im Subprozess (Service Account via ENV)
+    ee_prelude = (
+        "try:\n"
+        "    import os, ee\n"
+        "    _sa=os.environ.get('EE_SERVICE_ACCOUNT')\n"
+        "    _key=os.environ.get('EE_PRIVATE_KEY')\n"
+        "    _proj=os.environ.get('EE_PROJECT')\n"
+        "    if _sa and _key and _proj:\n"
+        "        credentials=ee.ServiceAccountCredentials(_sa, _key)\n"
+        "        ee.Initialize(credentials=credentials, project=_proj)\n"
+        "    else:\n"
+        "        ee.Initialize()\n"
+        "except Exception as _e:\n"
+        "    pass\n\n"
+    )
+    code_with_prelude = ee_prelude + (code or "")
+
     target = SANDBOX_DIR / filename
-    target.write_text(code, encoding="utf-8")
+    target.write_text(code_with_prelude, encoding="utf-8")
 
-    # exakt denselben Interpreter + Env verwenden wie die Haupt-App
-    py = sys.executable
+    # Subprozess-Umgebung: Repo in PYTHONPATH + EE-Secrets weitergeben
     env = os.environ.copy()
-
-    # WICHTIG: Repo-Root in den Importpfad für den Subprozess legen,
-    # damit 'import blocks....' funktioniert.
-    existing_pp = env.get("PYTHONPATH", "")
-    parts = [str(BASE_DIR)]
-    if existing_pp:
-        parts.append(existing_pp)
-    env["PYTHONPATH"] = os.pathsep.join(parts)
+    env["PYTHONPATH"] = f"{str(BASE_DIR)}" + (":" + env["PYTHONPATH"] if "PYTHONPATH" in env and env["PYTHONPATH"] else "")
+    # EE-Secrets (falls vorhanden) in ENV spiegeln
+    try:
+        sa = st.secrets.get("EE_SERVICE_ACCOUNT")
+        key = st.secrets.get("EE_PRIVATE_KEY")
+        proj = st.secrets.get("EE_PROJECT")
+        if sa and key and proj:
+            env["EE_SERVICE_ACCOUNT"] = sa
+            env["EE_PRIVATE_KEY"] = key
+            env["EE_PROJECT"] = proj
+    except Exception:
+        pass
 
     if mode == "script":
         try:
             proc = subprocess.run(
-                [py, str(target)],
+                ["python", str(target)],
                 cwd=SANDBOX_DIR,
                 capture_output=True,
                 text=True,
                 timeout=timeout_sec,
-                env=env,  # <--- PYTHONPATH gesetzt
+                env=env,
             )
             return json.dumps({
                 "ok": proc.returncode == 0,
@@ -282,13 +302,12 @@ def _tool_run_python_impl(code: str,
     if mode == "streamlit":
         try:
             proc = subprocess.Popen(
-                [py, "-m", "streamlit", "run", str(target),
-                 "--server.headless", "true", "--server.port", str(port)],
+                ["streamlit", "run", str(target), "--server.headless", "true", "--server.port", str(port)],
                 cwd=SANDBOX_DIR,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                env=env,  # <--- PYTHONPATH gesetzt
+                env=env,
             )
             try:
                 bootstrap = proc.stdout.readline().strip() if proc.stdout else ""
@@ -313,7 +332,6 @@ def _tool_run_python_impl(code: str,
             }, ensure_ascii=False)
 
     return json.dumps({"error": f"unknown mode '{mode}'"})
-
 
 # Für den Agenten als Tool registrieren:
 tool_run_python = function_tool(_tool_run_python_impl)
@@ -595,7 +613,7 @@ if prompt and not ui_only_rerun:
     st.session_state.messages.append({"role": "assistant", "content": ui_answer})
     st.session_state["last_assistant_text"] = ui_answer
 
-    # 4) Code-Block extrahieren → Self-Heal → Sichtbar ausführen
+    # 4) Code-Block extrahieren → Self-Heal → Auto-Runner (kein Code anzeigen)
     code_block = extract_first_python_block(answer)  # aus dem Originaltext, NICHT ui_answer
     if code_block:
         st.session_state.last_code = code_block
@@ -606,7 +624,33 @@ if prompt and not ui_only_rerun:
             try:
                 compiled = compile(final_code, "<visible>", "exec")
                 exec(compiled, ns, ns)
-                st.sidebar.caption("Code automatisch repariert und ausgeführt.")
+                # Direkt im Anschluss: Runner (script) automatisch starten
+                _resp = _tool_run_python_impl(final_code, mode="script")
+                try:
+                    res = json.loads(_resp) if isinstance(_resp, str) else _resp
+                except Exception:
+                    res = {"ok": False, "stderr": "Runner response decode failed."}
+                if not res.get("ok"):
+                    # Ein zusätzlicher Fixer-Versuch mit Runner-stderr
+                    runner_err = res.get("stderr", "")
+                    patched = _sh_fix_code_once(final_code, runner_err) if runner_err else None
+                    if patched and patched.strip() != final_code.strip():
+                        # erneut in-process testen
+                        try:
+                            compiled2 = compile(patched, "<visible>", "exec")
+                            exec(compiled2, ns, ns)
+                            # und erneut Runner
+                            _resp2 = _tool_run_python_impl(patched, mode="script")
+                            res2 = json.loads(_resp2) if isinstance(_resp2, str) else _resp2
+                            if res2.get("ok"):
+                                st.sidebar.caption("Runner erfolgreich nach Auto-Fix.")
+                                st.session_state.last_code = patched
+                            else:
+                                st.sidebar.warning("Runner-Fehler blieb bestehen (siehe Logs im Backend).")
+                        except Exception:
+                            st.sidebar.warning("Auto-Fix nach Runner-Fehler schlug fehl.")
+                else:
+                    st.sidebar.caption("Runner erfolgreich ausgeführt.")
             except Exception:
                 st.error("Es gab einen Ausführungsfehler. Ich konnte ihn nicht automatisch beheben.")
                 st.caption("Hinweis: Details sind intern protokolliert.")
@@ -618,24 +662,4 @@ if prompt and not ui_only_rerun:
     st.session_state["skip_agent_on_next_run"] = True
     st.rerun()
 
-# ===== Optional: Runner-Panel (Subprozess) ====================================
-st.write("---")
-st.subheader("Runner (Subprozess)")
-code_str = st.session_state.get("last_code", "")
-if code_str:
-    st.caption("Ein ausführbarer Stand liegt vor.")
-    c1, c2 = st.columns(2)
-    if c1.button("Run in Runner (script)"):
-        with st.spinner("Runner (script)…"):
-            _resp = _tool_run_python_impl(code_str, mode="script")  # interne Impl direkt aufrufen
-            res = json.loads(_resp) if isinstance(_resp, str) else _resp
-        st.write(res)
-    if c2.button("Run in Runner (streamlit)"):
-        with st.spinner("Runner (streamlit)…"):
-            _resp = _tool_run_python_impl(code_str, filename="agent_streamlit.py", mode="streamlit", port=8502)
-            res = json.loads(_resp) if isinstance(_resp, str) else _resp
-        st.write(res)
-        if res.get("ok") and res.get("url"):
-            st.info("Hinweis: Auf Cloud-Hosts ist die zweite Streamlit-Instanz in der Regel nicht erreichbar.")
-            st.success(f"Lokale URL (falls lokal ausgeführt): {res['url']}  (PID: {res.get('pid')})")
-
+# Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
