@@ -377,6 +377,15 @@ def _extract_plan_spec_from_text(answer_text: str) -> Tuple[Optional[dict], str]
     return None, text
 
 # ===== Agent Setup + persistente SDK-Session ==================================
+
+# --- NEU: strukturiertes Output-Schema des Haupt-Agenten ----------------------
+class MainOutputs:
+    def __init__(self,
+                 plan_spec: Optional[Dict[str, Any]] = None,
+                 code: Optional[str] = None):
+        self.plan_spec = plan_spec
+        self.code = code
+
 if AGENTS_OK:
     openai_client = AsyncOpenAI()  # nutzt OPENAI_API_KEY
     agent = Agent(
@@ -384,6 +393,7 @@ if AGENTS_OK:
         instructions=MEGA_PROMPT,
         tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python],
         model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
+        output_type=MainOutputs,  # <<< NEU: strukturierte Ausgaben (plan_spec, code)
     )
 else:
     agent = None
@@ -586,40 +596,63 @@ if prompt and not ui_only_rerun:
         max_turns=60,
     )
 
-    raw_answer = result.final_output or ""
-    answer = raw_answer
+    # ===== Sichtbarer Text (ohne Code) & strukturierte Outputs bevorzugen =====
+    out = getattr(result, "final_output", None)
 
-    # PLAN_SPEC ggf. intern aus Outputs lesen; sonst aus Text extrahieren
-    try:
-        plan_spec_obj = None
-        if hasattr(result, "outputs") and isinstance(result.outputs, dict):
-            plan_spec_obj = result.outputs.get("plan_spec", None)
-        if plan_spec_obj is None and hasattr(result, "named_outputs") and isinstance(result.named_outputs, dict):
-            plan_spec_obj = result.named_outputs.get("plan_spec", None)
-        if plan_spec_obj is None:
-            extracted, cleaned_text = _extract_plan_spec_from_text(raw_answer)
-            if extracted:
-                plan_spec_obj = extracted
-                answer = cleaned_text
-        if plan_spec_obj is not None and _looks_like_plan_spec(plan_spec_obj):
-            st.session_state["last_plan_spec"] = plan_spec_obj
-    except Exception:
-        pass
+    # Sichtbarer Text aus bekannten Feldern beziehen; Fallbacks zulassen
+    visible_text = ""
+    for attr in ("text", "final_output_text", "message", "output_text"):
+        v = getattr(result, attr, None)
+        if isinstance(v, str) and v.strip():
+            visible_text = v
+            break
+    if isinstance(out, str) and not visible_text:
+        visible_text = out
+
+    # PLAN_SPEC / CODE strukturiert lesen
+    plan_spec_obj = None
+    code_out = None
+    if out is not None:
+        plan_spec_obj = getattr(out, "plan_spec", None)
+        code_out = getattr(out, "code", None)
+
+    # ggf. weitere Kanäle (named outputs / dict)
+    if plan_spec_obj is None and hasattr(result, "outputs") and isinstance(result.outputs, dict):
+        plan_spec_obj = result.outputs.get("plan_spec", None)
+    if code_out is None and hasattr(result, "outputs") and isinstance(result.outputs, dict):
+        code_out = result.outputs.get("code", None)
+
+    # Als letzte Option: PLAN_SPEC aus sichtbarem Text extrahieren
+    if plan_spec_obj is None and isinstance(visible_text, str):
+        extracted, cleaned_text = _extract_plan_spec_from_text(visible_text)
+        if extracted:
+            plan_spec_obj = extracted
+            visible_text = cleaned_text
 
     # 3) Assistant-Antwort rendern (Codefences ausblenden)
-    ui_answer = strip_fenced_code_blocks(answer)
+    ui_answer = strip_fenced_code_blocks(visible_text or "")
     with st.chat_message("assistant"):
         st.markdown(ui_answer)
     st.session_state.messages.append({"role": "assistant", "content": ui_answer})
     st.session_state["last_assistant_text"] = ui_answer
 
-    # 4) Code-Block extrahieren → Self-Heal → Auto-Runner (kein Code anzeigen)
-    code_block = extract_first_python_block(answer)  # aus dem Originaltext, NICHT ui_answer
-    if code_block:
-        st.session_state.last_code = code_block
-        ok, final_code, heal_log = self_heal_until_runs(code_block, max_rounds=5)
+    # PLAN_SPEC intern merken (unsichtbar)
+    try:
+        if plan_spec_obj is not None and _looks_like_plan_spec(plan_spec_obj):
+            st.session_state["last_plan_spec"] = plan_spec_obj
+    except Exception:
+        pass
+
+    # 4) Code → Self-Heal → Auto-Ausführen (silent). Struktur bevorzugt; Fallback: Markdown-Parsing
+    if not isinstance(code_out, str) or not code_out.strip():
+        # Fallback auf Markdown-Codeblock nur, wenn kein strukturiertes "code" kam
+        code_out = extract_first_python_block(visible_text or "")
+
+    if isinstance(code_out, str) and code_out.strip():
+        st.session_state.last_code = code_out
+        ok, final_code, heal_log = self_heal_until_runs(code_out, max_rounds=5)
         if ok:
-            # sichtbar ausführen (in-process)
+            # sichtbar ausführen (in-process) – ohne Code anzuzeigen
             ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
             try:
                 compiled = compile(final_code, "<visible>", "exec")
@@ -650,7 +683,7 @@ if prompt and not ui_only_rerun:
                         except Exception:
                             st.sidebar.warning("Auto-Fix nach Runner-Fehler schlug fehl.")
                 else:
-                    st.sidebar.caption("Runner erfolgreich ausgeführt.")
+                    st.sidebar.caption("Code ausgeführt • Runner erfolgreich ausgeführt.")
             except Exception:
                 st.error("Es gab einen Ausführungsfehler. Ich konnte ihn nicht automatisch beheben.")
                 st.caption("Hinweis: Details sind intern protokolliert.")
