@@ -189,44 +189,12 @@ def tool_get_uc_sections(uc_id: str, sections: List[str]) -> str:
             out[sec] = data[sec]
     return _safe_json(out)
 
-@function_tool
-def tool_bundle_components(components: List[str]) -> str:
-    """
-    Lädt mehrere Komponenten und liefert:
-    {
-      "bundle": "<concatenated files mit BEGIN/END headers>",
-      "manifest": [{"id": path, "sha1": "...", "bytes": N}, ...]
-    }
-    """
-    bundle_parts: List[str] = []
-    manifest: List[Dict[str, Any]] = []
-
-    LEGACY_DIR = BASE_DIR / "blocks" / "components" / "legacy"
-
-    for rel in components or []:
-        p = (BASE_DIR / rel).resolve()
-        if not str(p).startswith(str(BASE_DIR)):
-            return _safe_json({"error": f"component outside repo scope: {rel}"})
-        if LEGACY_DIR in p.parents or p.name.startswith("fs_"):
-            return _safe_json({"error": f"legacy component not allowed: {rel}"})
-        if not p.exists():
-            return _safe_json({"error": f"component not found: {rel}"})
-
-        txt = p.read_text(encoding="utf-8")
-        h = _sha1_text(txt)
-        header = f"\n# ==== BEGIN COMPONENT: {rel} (sha1:{h}) ====\n"
-        footer = f"\n# ==== END COMPONENT: {rel} ====\n"
-        bundle_parts.append(header + txt + footer)
-        manifest.append({"id": rel, "sha1": h, "bytes": len(txt.encode("utf-8"))})
-
-    return _safe_json({"bundle": "\n".join(bundle_parts), "manifest": manifest})
-
-@function_tool
-def tool_run_python(code: str,
-                    filename: Optional[str] = None,
-                    timeout_sec: int = 600,
-                    mode: str = "script",
-                    port: int = 8502) -> str:
+# --- HINWEIS: tool_run_python als interne Implementierung + Tool-Wrapper -----
+def _tool_run_python_impl(code: str,
+                          filename: Optional[str] = None,
+                          timeout_sec: int = 600,
+                          mode: str = "script",
+                          port: int = 8502) -> str:
     """
     Führt Code im runner/sandbox aus.
     - mode="script":  python file.py (stdout/stderr)
@@ -296,6 +264,9 @@ def tool_run_python(code: str,
             }, ensure_ascii=False)
 
     return json.dumps({"error": f"unknown mode '{mode}'"})
+
+# Für den Agenten als Tool registrieren:
+tool_run_python = function_tool(_tool_run_python_impl)
 
 # ===== PLAN_SPEC-Handling (robust) ============================================
 PLAN_SPEC_KEY_CANDIDATES = ("use_case", "aoi_spec", "render", "components")
@@ -606,12 +577,12 @@ if code_str:
     c1, c2 = st.columns(2)
     if c1.button("Run in Runner (script)"):
         with st.spinner("Runner (script)…"):
-            _resp = tool_run_python(code_str, mode="script")  # kann str ODER dict sein
+            _resp = _tool_run_python_impl(code_str, mode="script")  # interne Impl direkt aufrufen
             res = json.loads(_resp) if isinstance(_resp, str) else _resp
         st.write(res)
     if c2.button("Run in Runner (streamlit)"):
         with st.spinner("Runner (streamlit)…"):
-            _resp = tool_run_python(code_str, filename="agent_streamlit.py", mode="streamlit", port=8502)
+            _resp = _tool_run_python_impl(code_str, filename="agent_streamlit.py", mode="streamlit", port=8502)
             res = json.loads(_resp) if isinstance(_resp, str) else _resp
         st.write(res)
         if res.get("ok") and res.get("url"):
