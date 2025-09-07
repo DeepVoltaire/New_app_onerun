@@ -161,7 +161,6 @@ def ee_maybe_init() -> bool:
         if not (sa and key and proj):
             return False
 
-        # Schlüsselmaterial tolerant verarbeiten (dict oder JSON-String)
         import json as _json
         key_json_str: Optional[str] = None
         if isinstance(key, dict):
@@ -170,7 +169,6 @@ def ee_maybe_init() -> bool:
             key_json_str = key.strip()
 
         if key_json_str and key_json_str.startswith("{"):
-            # Direkt aus JSON-Inhalt Credentials bauen
             from google.oauth2 import service_account as _sa_mod
             scopes = [
                 "https://www.googleapis.com/auth/earthengine",
@@ -179,7 +177,6 @@ def ee_maybe_init() -> bool:
             creds = _sa_mod.Credentials.from_service_account_info(_json.loads(key_json_str), scopes=scopes)
             ee.Initialize(credentials=creds, project=proj)
         else:
-            # Fallback: in Temp-Datei schreiben und klassisch initialisieren
             import tempfile as _tf
             with _tf.NamedTemporaryFile("w", delete=False, suffix=".json") as fp:
                 if key_json_str:
@@ -188,7 +185,6 @@ def ee_maybe_init() -> bool:
             creds = ee.ServiceAccountCredentials(sa, key_path)
             ee.Initialize(credentials=creds, project=proj)
 
-        # Health-Check
         ee.Number(1).getInfo()
         return True
     except Exception:
@@ -332,7 +328,6 @@ def _tool_run_python_impl(code: str,
     # Subprozess-Umgebung: Repo in PYTHONPATH + EE-Secrets weitergeben
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{str(BASE_DIR)}" + (":" + env["PYTHONPATH"] if "PYTHONPATH" in env and env["PYTHONPATH"] else "")
-    # EE-Secrets (falls vorhanden) in ENV spiegeln
     try:
         sa = st.secrets.get("EE_SERVICE_ACCOUNT")
         key = st.secrets.get("EE_PRIVATE_KEY")
@@ -449,10 +444,17 @@ def _extract_plan_spec_from_text(answer_text: str) -> Tuple[Optional[dict], str]
 
 # ===== Agent Setup + persistente SDK-Session ==================================
 if AGENTS_OK:
-    from pydantic import BaseModel
+    # --- ONLY plan_spec as structured output (Pydantic v2 safe) ---------------
+    from pydantic import BaseModel, Field
 
     class PlanSpecOnly(BaseModel):
-        plan_spec: Optional[Dict[str, Any]] = None
+        plan_spec: Optional[Dict[str, Any]] = Field(default=None)
+
+    # Fix for "class-not-fully-defined" on some environments
+    try:
+        PlanSpecOnly.model_rebuild()
+    except Exception:
+        pass
 
     openai_client = AsyncOpenAI()  # nutzt OPENAI_API_KEY
     agent = Agent(
@@ -691,9 +693,8 @@ if prompt and not ui_only_rerun:
         st.session_state["last_plan_spec"] = extracted
         visible_text = cleaned_text
 
-    # PLAN_SPEC / CODE strukturiert lesen (bevor wir rendern)
+    # PLAN_SPEC strukturiert lesen (bevor wir rendern)
     plan_spec_obj = None
-    code_out = None
     if out is not None:
         plan_spec_obj = getattr(out, "plan_spec", None)
     if plan_spec_obj is None and hasattr(result, "outputs") and isinstance(result.outputs, dict):
@@ -712,19 +713,15 @@ if prompt and not ui_only_rerun:
     st.session_state["last_assistant_text"] = ui_answer
 
     # 4) Code → Self-Heal → Auto-Ausführen (silent). Struktur bevorzugt; Fallback: Markdown-Parsing
-    if not isinstance(code_out, str) or not code_out.strip():
-        code_out = extract_first_python_block(visible_text or "")
-
+    code_out = extract_first_python_block(visible_text or "")
     if isinstance(code_out, str) and code_out.strip():
         st.session_state.last_code = code_out
         ok, final_code, heal_log = self_heal_until_runs(code_out, max_rounds=5)
         if ok:
-            # sichtbar ausführen (in-process) – ohne Code anzuzeigen
             ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
             try:
                 compiled = compile(final_code, "<visible>", "exec")
                 exec(compiled, ns, ns)
-                # Direkt im Anschluss: Runner (script) automatisch starten (einmalig)
                 _resp = _tool_run_python_impl(final_code, mode="script")
                 try:
                     res = json.loads(_resp) if isinstance(_resp, str) else _resp
@@ -734,7 +731,6 @@ if prompt and not ui_only_rerun:
                     st.session_state._runner_autorun_done = True
                     st.sidebar.caption("Code ausgeführt • Runner erfolgreich ausgeführt.")
                 else:
-                    # Ein zusätzlicher Fixer-Versuch mit Runner-stderr
                     runner_err = res.get("stderr", "")
                     patched = _sh_fix_code_once(final_code, runner_err) if runner_err else None
                     if patched and patched.strip() != final_code.strip():
@@ -758,7 +754,6 @@ if prompt and not ui_only_rerun:
             with st.expander("Fehler beim automatischen Ausführen – Logs", expanded=True):
                 st.write(heal_log)
 
-    # Nach Abschluss: Buttons sofort neu rendern → UI-only Re-Run
     st.session_state["skip_agent_on_next_run"] = True
     st.rerun()
 
