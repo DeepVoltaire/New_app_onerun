@@ -498,10 +498,7 @@ def _sh_fix_code_once(code_text: str, error_log: str) -> Optional[str]:
         return None
 
 def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
-    buf = _sh_io.StringIO()
-    _stdout = _sh_sys.stdout
-    _stderr = _sh_sys.stderr
-    ok = False
+    ...
     try:
         _sh_sys.stdout = buf
         _sh_sys.stderr = buf
@@ -509,13 +506,14 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
         compiled = compile(code_text, "<healed>", "exec")
         exec(compiled, ns, ns)
         ok = True
-    except Exception as e:
-        out = buf.getvalue() + f"\nERROR: {e!r}"
+    except BaseException as e:  # <— wichtig: Stop/Rerun werden gefangen
+        out = buf.getvalue() + f"\nERROR({e.__class__.__name__}): {e!r}"
         return False, out
     finally:
         _sh_sys.stdout = _stdout
         _sh_sys.stderr = _stderr
     return ok, buf.getvalue()
+
 
 def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str, List[str]]:
     logs: List[str] = []
@@ -699,9 +697,9 @@ if prompt and not ui_only_rerun:
                                 st.sidebar.warning("Runner-Fehler blieb bestehen (siehe Logs im Backend).")
                         except Exception:
                             st.sidebar.warning("Auto-Fix nach Runner-Fehler schlug fehl.")
-            except Exception:
+            except BaseException as e:
                 st.error("Es gab einen Ausführungsfehler. Ich konnte ihn nicht automatisch beheben.")
-                st.caption("Hinweis: Details sind intern protokolliert.")
+                st.caption(f"Hinweis: {getattr(e, '__class__', type(e)).__name__} wurde abgefangen; Details sind intern protokolliert.")
         else:
             with st.expander("Fehler beim automatischen Ausführen – Logs", expanded=True):
                 st.write(heal_log)
@@ -715,14 +713,16 @@ if prompt and not ui_only_rerun:
 # rendere die letzte App erneut und starte den Runner genau einmal automatisch.
 if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
     try:
-        ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
-        compiled = compile(st.session_state.last_code, "<autorender>", "exec")
-        exec(compiled, ns, ns)
-        if not st.session_state._runner_autorun_done:
-            _ = _tool_run_python_impl(st.session_state.last_code, mode="script")
-            st.session_state._runner_autorun_done = True
-            st.sidebar.caption("Runner automatisch gestartet.")
-    except Exception:
+    ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
+    compiled = compile(st.session_state.last_code, "<autorender>", "exec")
+    exec(compiled, ns, ns)
+    if not st.session_state._runner_autorun_done:
+        _ = _tool_run_python_impl(st.session_state.last_code, mode="script")
+        st.session_state._runner_autorun_done = True
+        st.sidebar.caption("Runner automatisch gestartet.")
+    except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
+
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
+
