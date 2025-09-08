@@ -27,109 +27,6 @@ RUNNER_DIR = BASE_DIR / "runner"
 SANDBOX_DIR = RUNNER_DIR / "sandbox"
 SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
 
-# ===== Komponenten-Pakete absichern + Sanitizer + Autorun =====================
-def ensure_component_packages() -> None:
-    """
-    Stellt sicher, dass alle relevanten Ordner als Python-Pakete fungieren.
-    (rel. Imports in Komponenten wie '.gif_label_overlay' funktionieren sonst nicht.)
-    """
-    pkg_dirs = [
-        BASE_DIR / "blocks",
-        BASE_DIR / "blocks" / "components",
-        BASE_DIR / "blocks" / "components" / "gee",
-        BASE_DIR / "blocks" / "components" / "visual",
-        BASE_DIR / "blocks" / "components" / "util",
-        BASE_DIR / "blocks" / "components" / "ui",
-    ]
-    for d in pkg_dirs:
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-            initf = d / "__init__.py"
-            if not initf.exists():
-                initf.write_text("# package init\n", encoding="utf-8")
-        except Exception:
-            # still continue; worst case the import-heal-loop tries to patch around it
-            pass
-
-def sanitize_code_for_preflight(src: str) -> str:
-    """
-    Minimal-invasive, deterministische Fixes vor dem Preflight:
-    - future-import richtig stellen
-    - fehlerhaften Main-Guard entfernen (wir rufen main() ohnehin explizit)
-    """
-    if not isinstance(src, str) or not src.strip():
-        return src or ""
-    fixed = src.replace("from future import annotations", "from __future__ import annotations")
-    # Entferne if name == "main": main() (verschiedene Schreibweisen tolerant)
-    fixed = re.sub(
-        r"\bif\s+name\s*==\s*['\"]main['\"]\s*:\s*main\(\)\s*",
-        "",
-        fixed,
-        flags=re.IGNORECASE,
-    )
-    return fixed
-
-def autorun_from_code(code_text: str) -> None:
-    """
-    Vollständige Autorun-Pipeline für strukturierten Builder-Code:
-    1) Pakete absichern
-    2) Preflight (py_compile)
-    3) Heal-Loop (Runtime/Import)
-    4) Render (Entry-Point-Aufruf)
-    """
-    ensure_component_packages()
-
-    # 1) Syntax-Preflight ohne Prelude-Einschub
-    cleaned = sanitize_code_for_preflight(code_text)
-    try:
-        _pre = _tool_run_python_impl(cleaned, mode="script", preflight_only=True)
-        pre = json.loads(_pre) if isinstance(_pre, str) else _pre
-    except Exception:
-        pre = {"ok": False, "stderr": "preflight decode error"}
-
-    # 2) Einmaliger Syntax-Fix via Fixer, falls nötig
-    if not pre.get("ok", False):
-        patched_once = _sh_fix_code_once(cleaned, pre.get("stderr", ""))
-        if patched_once and patched_once.strip():
-            cleaned = patched_once
-
-    # 3) Heal-Loop (Runtime/Import im Hauptprozess)
-    ok, final_code, heal_log = self_heal_until_runs(cleaned, max_rounds=5)
-    if not ok:
-        with st.expander("Fehler beim automatischen Ausführen – Logs", expanded=True):
-            st.write(heal_log)
-        return
-
-    # 4) Rendern: Code ausführen + Entry-Point aufrufen
-    ns: Dict[str, object] = {"__name__": "__generated__", "st": st}
-    try:
-        compiled = compile(final_code, "<visible>", "exec")
-        exec(compiled, ns, ns)
-
-        entry = None
-        for fn_name in ("t2e_app", "render", "main"):
-            fn = ns.get(fn_name)
-            if callable(fn):
-                entry = fn
-                break
-        if entry:
-            try:
-                entry()
-            except TypeError:
-                try:
-                    entry(st)
-                except Exception:
-                    pass
-
-        # Subprozess nur als py_compile-Bestätigung (keine Render-Dopplung)
-        _ = _tool_run_python_impl(final_code, mode="script", preflight_only=True)
-        st.session_state._runner_autorun_done = True
-        st.session_state.last_code = final_code
-        st.sidebar.caption("Code ausgeführt • Preflight ok.")
-    except BaseException as e:
-        st.error("Es gab einen Ausführungsfehler. Ich konnte ihn nicht automatisch beheben.")
-        st.caption(f"Hinweis: {getattr(e, '__class__', type(e)).__name__} wurde abgefangen; Details sind intern protokolliert.")
-
 # ===== Parser & UI: Bullets → Buttons (alle: •, -, *) =========================
 BULLET_RE = re.compile(r'^\s*([•\-\*])\s+(.+)$')
 
@@ -792,7 +689,7 @@ _SH_FIXER_PROMPT = """
 You are AGENT 2 (Fixer). Return ONLY a single, fully runnable Python file. No prose. No explanations.
 INTERNAL MANDATE (do not output):
 1) DIAGNOSE: Read the error + code. Identify root causes (imports, names, EE usage, missing vars, Streamlit lifecycle).
-2) HYPOTHESES: Consider secondary issues beyond the immediate error (hidden imports, state keys, async/sync, file I/O).
+2) HYPOTHESES: Consider secondary issues beyond the immediate error (hidden imports, state keys, file I/O).
 3) PATCH PLAN: Minimal-invasive changes only. Preserve all working behavior. Do not add new deps; no EE init/auth.
 4) SELF-CHECK: Syntax parse, import sanity, Streamlit run path, forbidden patterns (ee.Initialize/Authenticate), no prints.
 5) FINALIZE: Output ONLY the corrected Python code.
@@ -874,6 +771,23 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
         ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
         compiled = compile(code_text, "<healed>", "exec")
         exec(compiled, ns, ns)
+
+        # <<< Änderung A: echten Run erzwingen – Entry-Point suchen & ausführen >>>
+        entry = None
+        for fn_name in ("t2e_app", "render", "main"):
+            fn = ns.get(fn_name)
+            if callable(fn):
+                entry = fn
+                break
+        if entry is None:
+            raise RuntimeError("No callable entrypoint found (expected one of: t2e_app, render, main).")
+
+        try:
+            entry()  # bevorzugt ohne Argumente
+        except TypeError:
+            # Fallback: ggf. mit st durchreichen
+            entry(st)
+
         ok = True
     except BaseException as e:  # Stop/Rerun werden gefangen, Fixer kann triggern
         out = buf.getvalue() + f"\nERROR({e.__class__.__name__}): {e!r}"
@@ -989,7 +903,7 @@ if prompt and not ui_only_rerun:
                         delta = getattr(data, "delta", "") or ""
                         if delta:
                             streamed_parts.append(delta)
-                            holder.markdown(strip_fenced_code_blocks("".join(streamed_parts)))
+                            holder.markdown("".join(streamed_parts))
                 except Exception:
                     # Ignoriere unbekannte Event-Formate
                     pass
@@ -998,9 +912,8 @@ if prompt and not ui_only_rerun:
     # Führe das Streaming synchron aus
     result = asyncio.run(_agent0_stream_and_render())
     visible_text = "".join(streamed_parts)
-    ui_text_stream = strip_fenced_code_blocks(visible_text)
-    st.session_state.messages.append({"role": "assistant", "content": ui_text_stream})
-    st.session_state["last_assistant_text"] = ui_text_stream
+    st.session_state.messages.append({"role": "assistant", "content": visible_text})
+    st.session_state["last_assistant_text"] = visible_text
 
     # ===== Sichtbarer Text & strukturierte Outputs =====
     out = getattr(result, "final_output", None)
@@ -1060,100 +973,19 @@ if prompt and not ui_only_rerun:
         # Flag zurücksetzen, damit nicht erneut ausgelöst wird
         st.session_state._want_structured = False
 
-    # >>> JSON wins: Wenn der Builder Code geliefert hat, sofort die Autorun-Pipeline starten
-    if isinstance(code_out, str) and code_out.strip():
-        # PLAN_SPEC niemals anzeigen, nur persistieren
-        try:
-            if plan_spec_obj is not None:
-                st.session_state["last_plan_spec"] = plan_spec_obj
-        except Exception:
-            pass
-
-        # Sichtbarer Text (falls mitgeliefert) ist bereits gerendert; jetzt direkt ausführen.
-        autorun_from_code(code_out)
-        # UI-Fluss: keine weiteren Agent-Calls mehr in diesem Run, nur Repaint
-        st.session_state["skip_agent_on_next_run"] = True
-        st.rerun()
-
     # 4) Code → Self-Heal → Auto-Ausführen (silent). Struktur bevorzugt; Fallback: Markdown-Parsing
-    # WICHTIG: Wenn Builder-JSON bereits Code lieferte, sind wir oben schon in autorun_from_code() gegangen.
-    # Dieser Zweig ist NUR Fallback für den Fall, dass KEIN JSON-Code vorlag.
-    code_out = None  # JSON wins; hier wirklich nur Fallback nutzen
-    fallback_text = visible_text or ""
-    code_out = extract_first_python_block(fallback_text)
+    code_out = code_out or extract_first_python_block(visible_text or "")
     if isinstance(code_out, str) and code_out.strip():
         st.session_state.last_code = code_out
 
-        # Paketstruktur für Komponenten sicherstellen (relative Imports)
-        ensure_component_packages()
-
-        # 4a) Unsichtbarer Runner: schneller Syntax-Preflight (keine Ausführung)
-        try:
-            _pre = _tool_run_python_impl(code_out, mode="script", preflight_only=True)
-            pre = json.loads(_pre) if isinstance(_pre, str) else _pre
-        except Exception:
-            pre = {"ok": False, "stderr": "preflight decode error"}
-
-        # einmaliger Syntax-Fix (LLM) falls Preflight scheitert; Runtime-Fehler behandelt der Heal-Loop
-        if not pre.get("ok", False):
-            patched_once = _sh_fix_code_once(code_out, pre.get("stderr", ""))
-            if patched_once and patched_once.strip():
-                code_out = patched_once
-                st.session_state.last_code = code_out
-
-        # 4b) Heal-Loop für Runtime-/Import-Themen mit Inline-Exec (Hauptprozess)
+        # <<< Änderung B: KEIN Syntax-Preflight mehr; direkt echter Run im Heal-Loop >>>
         ok, final_code, heal_log = self_heal_until_runs(code_out, max_rounds=5)
+
         if ok:
-            ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
-            try:
-                compiled = compile(final_code, "<visible>", "exec")
-                exec(compiled, ns, ns)
-
-                # 4c) Sichtbares Rendern im Hauptprozess: Entry-Point explizit aufrufen
-                entry = None
-                for fn_name in ("t2e_app", "render", "main"):
-                    fn = ns.get(fn_name)
-                    if callable(fn):
-                        entry = fn
-                        break
-                if entry:
-                    try:
-                        entry()
-                    except TypeError:
-                        try:
-                            entry(st)
-                        except Exception:
-                            pass
-
-                # 4d) Subprozess nur noch als schneller Kompilierungs-Check (keine Render-Dopplung)
-                _resp = _tool_run_python_impl(final_code, mode="script", preflight_only=True)
-                try:
-                    res = json.loads(_resp) if isinstance(_resp, str) else _resp
-                except Exception:
-                    res = {"ok": False, "stderr": "Runner response decode failed."}
-                if res.get("ok"):
-                    st.session_state._runner_autorun_done = True
-                    st.sidebar.caption("Code ausgeführt • Runner erfolgreich ausgeführt.")
-                else:
-                    runner_err = res.get("stderr", "")
-                    patched = _sh_fix_code_once(final_code, runner_err) if runner_err else None
-                    if patched and patched.strip() != final_code.strip():
-                        try:
-                            compiled2 = compile(patched, "<visible>", "exec")
-                            exec(compiled2, ns, ns)
-                            _resp2 = _tool_run_python_impl(patched, mode="script", preflight_only=True)
-                            res2 = json.loads(_resp2) if isinstance(_resp2, str) else _resp2
-                            if res2.get("ok"):
-                                st.session_state._runner_autorun_done = True
-                                st.sidebar.caption("Runner erfolgreich nach Auto-Fix.")
-                                st.session_state.last_code = patched
-                            else:
-                                st.sidebar.warning("Runner-Fehler blieb bestehen (siehe Logs im Backend).")
-                        except Exception:
-                            st.sidebar.warning("Auto-Fix nach Runner-Fehler schlug fehl.")
-            except BaseException as e:
-                st.error("Es gab einen Ausführungsfehler. Ich konnte ihn nicht automatisch beheben.")
-                st.caption(f"Hinweis: {getattr(e, '__class__', type(e)).__name__} wurde abgefangen; Details sind intern protokolliert.")
+            # Nach erfolgreichem echten Run im Heal-Loop: Status setzen, Code persistieren
+            st.session_state._runner_autorun_done = True
+            st.session_state.last_code = final_code
+            st.sidebar.caption("Code ausgeführt • Runner erfolgreich ausgeführt.")
         else:
             with st.expander("Fehler beim automatischen Ausführen – Logs", expanded=True):
                 st.write(heal_log)
@@ -1167,8 +999,22 @@ if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
         ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
         compiled = compile(st.session_state.last_code, "<autorender>", "exec")
         exec(compiled, ns, ns)
+
+        # <<< Änderung C: Entry-Point im Autorender explizit aufrufen >>>
+        entry = None
+        for fn_name in ("t2e_app", "render", "main"):
+            fn = ns.get(fn_name)
+            if callable(fn):
+                entry = fn
+                break
+        if entry is None:
+            raise RuntimeError("Auto-Render: Kein Entry-Point gefunden (t2e_app/render/main).")
+        try:
+            entry()
+        except TypeError:
+            entry(st)
+
         if not st.session_state._runner_autorun_done:
-            _ = _tool_run_python_impl(st.session_state.last_code, mode="script", preflight_only=True)
             st.session_state._runner_autorun_done = True
             st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
