@@ -15,8 +15,6 @@ import streamlit as st
 import asyncio
 
 
-
-
 # ===== Pfade / Repo-Layout ====================================================
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
 KNOWLEDGE_DIR = BASE_DIR / "knowledge"
@@ -76,11 +74,11 @@ try:
     from agents import Agent, Runner, function_tool, SQLiteSession, AgentOutputSchema
     from agents.models.openai_responses import OpenAIResponsesModel
     from openai import AsyncOpenAI
+    from openai.types.responses import ResponseTextDeltaEvent
     openai_client = AsyncOpenAI() if AGENTS_OK else None  # init early for builder/refactor agents
 except Exception as e:
     AGENTS_OK = False
     AGENTS_IMPORT_ERROR = str(e)
-from openai.types.responses import ResponseTextDeltaEvent
 
 # --- Defaults, damit spätere Checks nie NameError werfen ---
 agent = None            # type: ignore
@@ -102,9 +100,6 @@ def load_text_file(path: pathlib.Path, fallback: str = "") -> str:
         return fallback
 
 MEGA_PROMPT = load_text_file(
-# === Builder marker rules (appended to MEGA_PROMPT for builder runs) ==================
-
-
     PROMPTS_DIR / "mega_prompt.md",
     fallback=(
         "SYSTEM: Du bist ein einzelner Gesprächs-Agent, der Mini-Apps baut (GEE-first, UI optional). "
@@ -166,8 +161,6 @@ REFACTOR_RULES = "\n".join([
 ])
 
 
-
-
 # ===== Hilfsfunktionen ========================================================
 def _sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
@@ -189,9 +182,8 @@ def strip_fenced_code_blocks(text: str) -> str:
     return CODE_FENCE_RE.sub("", text).strip()
 
 
-
 def ensure_event_loop() -> None:
-    """Event-Loop für Streamlit-Thread sicherstellen."""
+    """Event-Loop für Streamlit-Thread sicherstellen (nur: erstellen, nicht laufen lassen)."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -357,7 +349,6 @@ def tool_bundle_components(components: List[str]) -> str:
     return _safe_json({"bundle": "\n".join(bundle_parts), "manifest": manifest})
 
 # --- Runner-Tool: interne Impl + Tool-Wrapper, mit EE/Path-Prelude ------------
-
 def _tool_run_python_impl(code: str,
                           filename: Optional[str] = None,
                           timeout_sec: int = 600,
@@ -590,6 +581,7 @@ if AGENTS_OK:
         PlanSpecOnly.model_rebuild()
     except Exception:
         pass
+
 class UiPlanCode(BaseModel):
     """Structured output for builder: visible text + plan + code + block index."""
     user_markdown: str = Field(description="Visible user-facing markdown (no code fences).")
@@ -617,10 +609,6 @@ try:
     RefactorPatches.model_rebuild()
 except Exception:
     pass
-
-
-
-
 
 
 @function_tool
@@ -875,32 +863,37 @@ if prompt and not ui_only_rerun:
     if st.session_state.last_code:
         iteration_context = "\n\n[HINWEIS] Es liegt bereits ausführbarer Code vor; Iterationen sind möglich."
 
-    ensure_event_loop()
-
-    
-    # 2) Agent 0 streamen (sichtbarer Chat-Text, keine Codefences)
-    from openai.types.responses import ResponseTextDeltaEvent as _RespDelta
-    result_stream = Runner.run_streamed(
-        agent,
-        input=(prompt + iteration_context),
-        session=sdk_session,  # persistente Session
-        max_turns=60,
-    )
+    # ===== Agent 0: STREAMING mit laufender Event-Loop =====
+    # Wir rufen run_streamed *innerhalb* eines Coroutines auf und führen dieses mit asyncio.run aus,
+    # damit asyncio.create_task() im Agents-SDK eine laufende Loop vorfindet.
     streamed_parts: List[str] = []
-    with st.chat_message("assistant"):
-        _holder = st.empty()
-        async def _stream_to_ui():
+
+    async def _agent0_stream_and_render() -> Any:
+        result_stream = Runner.run_streamed(
+            agent,
+            input=(prompt + iteration_context),
+            session=sdk_session,
+            max_turns=60,
+        )
+        with st.chat_message("assistant"):
+            holder = st.empty()
             async for ev in result_stream.stream_events():
-                data = getattr(ev, "data", None)
-                if getattr(ev, "type", "") == "raw_response_event" and data and getattr(data, "type", "") == "response.output_text.delta":
-                    delta = getattr(data, "delta", None) or ""
-                    if delta:
-                        streamed_parts.append(delta)
-                        _holder.markdown("".join(streamed_parts))
-        ensure_event_loop()
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_stream_to_ui())
-    result = result_stream
+                try:
+                    data = getattr(ev, "data", None)
+                    ev_type = getattr(ev, "type", "") or ""
+                    data_type = getattr(data, "type", "") if data is not None else ""
+                    if ev_type == "raw_response_event" and data_type == "response.output_text.delta":
+                        delta = getattr(data, "delta", "") or ""
+                        if delta:
+                            streamed_parts.append(delta)
+                            holder.markdown("".join(streamed_parts))
+                except Exception:
+                    # Ignoriere unbekannte Event-Formate
+                    pass
+        return result_stream
+
+    # Führe das Streaming synchron aus
+    result = asyncio.run(_agent0_stream_and_render())
     visible_text = "".join(streamed_parts)
     st.session_state.messages.append({"role": "assistant", "content": visible_text})
     st.session_state["last_assistant_text"] = visible_text
@@ -910,7 +903,7 @@ if prompt and not ui_only_rerun:
 
     # Falls der Builder (Agent 1) bereits strukturiert geantwortet hat:
     plan_spec_obj = None
-    code_out = None
+    code_out: Optional[str] = None
     ui_text = None
     if out is not None and not isinstance(out, str):
         # Pydantic-Objekt UiPlanCode o. ä.
@@ -958,7 +951,7 @@ if prompt and not ui_only_rerun:
                     st.session_state["last_plan_spec"] = plan_spec_obj
             except Exception:
                 pass
-# 4) Code → Self-Heal → Auto-Ausführen (silent). Struktur bevorzugt; Fallback: Markdown-Parsing
+    # 4) Code → Self-Heal → Auto-Ausführen (silent). Struktur bevorzugt; Fallback: Markdown-Parsing
     code_out = code_out or extract_first_python_block(visible_text or "")
     if isinstance(code_out, str) and code_out.strip():
         st.session_state.last_code = code_out
