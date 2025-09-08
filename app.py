@@ -27,6 +27,109 @@ RUNNER_DIR = BASE_DIR / "runner"
 SANDBOX_DIR = RUNNER_DIR / "sandbox"
 SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
 
+# ===== Komponenten-Pakete absichern + Sanitizer + Autorun =====================
+def ensure_component_packages() -> None:
+    """
+    Stellt sicher, dass alle relevanten Ordner als Python-Pakete fungieren.
+    (rel. Imports in Komponenten wie '.gif_label_overlay' funktionieren sonst nicht.)
+    """
+    pkg_dirs = [
+        BASE_DIR / "blocks",
+        BASE_DIR / "blocks" / "components",
+        BASE_DIR / "blocks" / "components" / "gee",
+        BASE_DIR / "blocks" / "components" / "visual",
+        BASE_DIR / "blocks" / "components" / "util",
+        BASE_DIR / "blocks" / "components" / "ui",
+    ]
+    for d in pkg_dirs:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            initf = d / "__init__.py"
+            if not initf.exists():
+                initf.write_text("# package init\n", encoding="utf-8")
+        except Exception:
+            # still continue; worst case the import-heal-loop tries to patch around it
+            pass
+
+def sanitize_code_for_preflight(src: str) -> str:
+    """
+    Minimal-invasive, deterministische Fixes vor dem Preflight:
+    - future-import richtig stellen
+    - fehlerhaften Main-Guard entfernen (wir rufen main() ohnehin explizit)
+    """
+    if not isinstance(src, str) or not src.strip():
+        return src or ""
+    fixed = src.replace("from future import annotations", "from __future__ import annotations")
+    # Entferne if name == "main": main() (verschiedene Schreibweisen tolerant)
+    fixed = re.sub(
+        r"\bif\s+name\s*==\s*['\"]main['\"]\s*:\s*main\(\)\s*",
+        "",
+        fixed,
+        flags=re.IGNORECASE,
+    )
+    return fixed
+
+def autorun_from_code(code_text: str) -> None:
+    """
+    Vollständige Autorun-Pipeline für strukturierten Builder-Code:
+    1) Pakete absichern
+    2) Preflight (py_compile)
+    3) Heal-Loop (Runtime/Import)
+    4) Render (Entry-Point-Aufruf)
+    """
+    ensure_component_packages()
+
+    # 1) Syntax-Preflight ohne Prelude-Einschub
+    cleaned = sanitize_code_for_preflight(code_text)
+    try:
+        _pre = _tool_run_python_impl(cleaned, mode="script", preflight_only=True)
+        pre = json.loads(_pre) if isinstance(_pre, str) else _pre
+    except Exception:
+        pre = {"ok": False, "stderr": "preflight decode error"}
+
+    # 2) Einmaliger Syntax-Fix via Fixer, falls nötig
+    if not pre.get("ok", False):
+        patched_once = _sh_fix_code_once(cleaned, pre.get("stderr", ""))
+        if patched_once and patched_once.strip():
+            cleaned = patched_once
+
+    # 3) Heal-Loop (Runtime/Import im Hauptprozess)
+    ok, final_code, heal_log = self_heal_until_runs(cleaned, max_rounds=5)
+    if not ok:
+        with st.expander("Fehler beim automatischen Ausführen – Logs", expanded=True):
+            st.write(heal_log)
+        return
+
+    # 4) Rendern: Code ausführen + Entry-Point aufrufen
+    ns: Dict[str, object] = {"__name__": "__generated__", "st": st}
+    try:
+        compiled = compile(final_code, "<visible>", "exec")
+        exec(compiled, ns, ns)
+
+        entry = None
+        for fn_name in ("t2e_app", "render", "main"):
+            fn = ns.get(fn_name)
+            if callable(fn):
+                entry = fn
+                break
+        if entry:
+            try:
+                entry()
+            except TypeError:
+                try:
+                    entry(st)
+                except Exception:
+                    pass
+
+        # Subprozess nur als py_compile-Bestätigung (keine Render-Dopplung)
+        _ = _tool_run_python_impl(final_code, mode="script", preflight_only=True)
+        st.session_state._runner_autorun_done = True
+        st.session_state.last_code = final_code
+        st.sidebar.caption("Code ausgeführt • Preflight ok.")
+    except BaseException as e:
+        st.error("Es gab einen Ausführungsfehler. Ich konnte ihn nicht automatisch beheben.")
+        st.caption(f"Hinweis: {getattr(e, '__class__', type(e)).__name__} wurde abgefangen; Details sind intern protokolliert.")
+
 # ===== Parser & UI: Bullets → Buttons (alle: •, -, *) =========================
 BULLET_RE = re.compile(r'^\s*([•\-\*])\s+(.+)$')
 
@@ -886,7 +989,7 @@ if prompt and not ui_only_rerun:
                         delta = getattr(data, "delta", "") or ""
                         if delta:
                             streamed_parts.append(delta)
-                            holder.markdown("".join(streamed_parts))
+                            holder.markdown(strip_fenced_code_blocks("".join(streamed_parts)))
                 except Exception:
                     # Ignoriere unbekannte Event-Formate
                     pass
@@ -895,8 +998,9 @@ if prompt and not ui_only_rerun:
     # Führe das Streaming synchron aus
     result = asyncio.run(_agent0_stream_and_render())
     visible_text = "".join(streamed_parts)
-    st.session_state.messages.append({"role": "assistant", "content": visible_text})
-    st.session_state["last_assistant_text"] = visible_text
+    ui_text_stream = strip_fenced_code_blocks(visible_text)
+    st.session_state.messages.append({"role": "assistant", "content": ui_text_stream})
+    st.session_state["last_assistant_text"] = ui_text_stream
 
     # ===== Sichtbarer Text & strukturierte Outputs =====
     out = getattr(result, "final_output", None)
@@ -956,10 +1060,32 @@ if prompt and not ui_only_rerun:
         # Flag zurücksetzen, damit nicht erneut ausgelöst wird
         st.session_state._want_structured = False
 
+    # >>> JSON wins: Wenn der Builder Code geliefert hat, sofort die Autorun-Pipeline starten
+    if isinstance(code_out, str) and code_out.strip():
+        # PLAN_SPEC niemals anzeigen, nur persistieren
+        try:
+            if plan_spec_obj is not None:
+                st.session_state["last_plan_spec"] = plan_spec_obj
+        except Exception:
+            pass
+
+        # Sichtbarer Text (falls mitgeliefert) ist bereits gerendert; jetzt direkt ausführen.
+        autorun_from_code(code_out)
+        # UI-Fluss: keine weiteren Agent-Calls mehr in diesem Run, nur Repaint
+        st.session_state["skip_agent_on_next_run"] = True
+        st.rerun()
+
     # 4) Code → Self-Heal → Auto-Ausführen (silent). Struktur bevorzugt; Fallback: Markdown-Parsing
-    code_out = code_out or extract_first_python_block(visible_text or "")
+    # WICHTIG: Wenn Builder-JSON bereits Code lieferte, sind wir oben schon in autorun_from_code() gegangen.
+    # Dieser Zweig ist NUR Fallback für den Fall, dass KEIN JSON-Code vorlag.
+    code_out = None  # JSON wins; hier wirklich nur Fallback nutzen
+    fallback_text = visible_text or ""
+    code_out = extract_first_python_block(fallback_text)
     if isinstance(code_out, str) and code_out.strip():
         st.session_state.last_code = code_out
+
+        # Paketstruktur für Komponenten sicherstellen (relative Imports)
+        ensure_component_packages()
 
         # 4a) Unsichtbarer Runner: schneller Syntax-Preflight (keine Ausführung)
         try:
