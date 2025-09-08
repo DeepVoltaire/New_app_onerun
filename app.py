@@ -115,6 +115,7 @@ AGENT0_ADDENDUM = """
 - Sichtbarer Gesprächsführer (Markdown), niemals Code/JSON anzeigen.
 - Vor erstem Build: an Builder (Agent 1) übergeben.
 - Nach erstem erfolgreichen Build: alle Folge-Turns sind Refactor-Turns (Agent 2 übernimmt fachliche Änderungen).
+- Wenn die Stop-Kriterien (Mega-Prompt §12/§15) erfüllt sind: Rufe das Tool request_structured_output(reason="build", need_plan=True, need_code=True).
 """
 
 BUILDER_ADDENDUM = """
@@ -916,45 +917,49 @@ if prompt and not ui_only_rerun:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # 2) Agent 0: STREAMING (sichtbar, Markdown only)
-    if not AGENTS_OK or agent0 is None:
-        st.error("Agents SDK nicht verfügbar.")
-        st.stop()
+    handoff_done = False  # wird True, wenn Builder oder Refactor wirklich ausgeführt hat
 
-    streamed_parts: List[str] = []
+    # 2) Agent 0: STREAMING (sichtbar, Markdown only) — nur vor Handoff/ohne Refactor-Modus
+    in_refactor = bool(st.session_state.get("refactor_mode"))
+    if not in_refactor:
+        if not AGENTS_OK or agent0 is None:
+            st.error("Agents SDK nicht verfügbar.")
+            st.stop()
 
-    async def _agent0_stream_and_render() -> Any:
-        result_stream = Runner.run_streamed(
-            agent0,
-            input=prompt,
-            session=sdk_session,
-            max_turns=60,
-        )
-        with st.chat_message("assistant"):
-            holder = st.empty()
-            async for ev in result_stream.stream_events():
-                try:
-                    data = getattr(ev, "data", None)
-                    ev_type = getattr(ev, "type", "") or ""
-                    data_type = getattr(data, "type", "") if data is not None else ""
-                    if ev_type == "raw_response_event" and data_type == "response.output_text.delta":
-                        delta = getattr(data, "delta", "") or ""
-                        if delta:
-                            streamed_parts.append(delta)
-                            holder.markdown("".join(streamed_parts))
-                except Exception:
-                    pass
-        return result_stream
+        streamed_parts: List[str] = []
 
-    # Führe das Streaming synchron aus
-    result = asyncio.run(_agent0_stream_and_render())
-    visible_text = "".join(streamed_parts)
-    st.session_state.messages.append({"role": "assistant", "content": visible_text})
-    st.session_state["last_assistant_text"] = visible_text
+        async def _agent0_stream_and_render() -> Any:
+            result_stream = Runner.run_streamed(
+                agent0,
+                input=prompt,
+                session=sdk_session,
+                max_turns=60,
+            )
+            with st.chat_message("assistant"):
+                holder = st.empty()
+                async for ev in result_stream.stream_events():
+                    try:
+                        data = getattr(ev, "data", None)
+                        ev_type = getattr(ev, "type", "") or ""
+                        data_type = getattr(data, "type", "") if data is not None else ""
+                        if ev_type == "raw_response_event" and data_type == "response.output_text.delta":
+                            delta = getattr(data, "delta", "") or ""
+                            if delta:
+                                streamed_parts.append(delta)
+                                holder.markdown("".join(streamed_parts))
+                    except Exception:
+                        pass
+            return result_stream
 
-    # 3) LLM-first Routing: Vor erstem Build → Builder; danach → Refactor
-    if not st.session_state.get("build_completed", False):
-        # ALWAYS call Builder: einzige Quelle für UiPlanCode
+        # Führe das Streaming synchron aus
+        result = asyncio.run(_agent0_stream_and_render())
+        visible_text = "".join(streamed_parts)
+        st.session_state.messages.append({"role": "assistant", "content": visible_text})
+        st.session_state["last_assistant_text"] = visible_text
+
+    # 3) LLM-first Routing: Handoff → Builder; danach → Refactor
+    if (not st.session_state.get("build_completed", False)) and bool(st.session_state.get("_want_structured")):
+        # Builder nur nach explizitem Handoff durch Agent 0
         ensure_event_loop()
         builder_result = Runner.run_sync(
             builder_agent,
@@ -962,6 +967,9 @@ if prompt and not ui_only_rerun:
             session=sdk_session,
             max_turns=40,
         )
+        # Handoff-Flag sofort zurücksetzen
+        st.session_state._want_structured = False
+
         builder_out = getattr(builder_result, "final_output", None)
         plan_spec_obj = None
         code_out: Optional[str] = None
@@ -985,7 +993,7 @@ if prompt and not ui_only_rerun:
                 "components_manifest": components_manifest,
             }
 
-            # Sichtbar: nur user_markdown
+            # Sichtbar: nur user_markdown (Builder darf nach Handoff sprechen)
             if isinstance(ui_text2, str) and ui_text2.strip():
                 with st.chat_message("assistant"):
                     st.markdown(ui_text2)
@@ -995,14 +1003,16 @@ if prompt and not ui_only_rerun:
             # Preflight (unsichtbar) → Fixer-Loop bei Bedarf; danach sichtbarer Autorun + Moduswechsel
             if isinstance(code_out, str) and code_out.strip():
                 ok = preflight_and_switch(code_out)
-                if not ok:
+                if ok:
+                    handoff_done = True
+                else:
                     with st.chat_message("assistant"):
                         st.markdown("Ich behebe Laufzeitfehler im Hintergrund und starte die App, sobald sie stabil läuft.")
         else:
             with st.chat_message("assistant"):
                 st.markdown("Ich konnte den strukturierten Build nicht erstellen. Bitte bestätige kurz Ziel, Gebiet und Zeitraum.")
-    else:
-        # Refactor-Modus: Agent 2 spricht sichtbar und liefert Patches
+    elif st.session_state.get("build_completed", False):
+        # Refactor-Modus: NUR Agent 2 (Agent 0 spricht hier nicht mehr)
         ctx = st.session_state.builder_context
         ref_in = {
             "user_change_request": prompt,
@@ -1020,18 +1030,29 @@ if prompt and not ui_only_rerun:
         )
         patches_payload = getattr(ref_res, "final_output", None)
         if patches_payload and not isinstance(patches_payload, str):
+            # Sichtbar: optionales Refactor-Markdown aus dem JSON
+            user_md = patches_payload.get("user_markdown")
+            if isinstance(user_md, str) and user_md.strip():
+                with st.chat_message("assistant"):
+                    st.markdown(user_md)
+                st.session_state.messages.append({"role": "assistant", "content": user_md})
+                st.session_state["last_assistant_text"] = user_md
+
             patched_code = apply_patches(ctx["code"], patches_payload.get("patches", []), strategy="body_only")
             st.session_state.builder_context["code"] = patched_code
             ok = preflight_and_switch(patched_code)
-            if not ok:
+            if ok:
+                handoff_done = True
+            else:
                 with st.chat_message("assistant"):
                     st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
         else:
             with st.chat_message("assistant"):
                 st.markdown("Ich konnte keine gültigen Patches erzeugen. Bitte beschreibe die gewünschte Änderung konkreter.")
 
-    st.session_state["skip_agent_on_next_run"] = True
-    st.rerun()
+    if handoff_done:
+        st.session_state["skip_agent_on_next_run"] = True
+        st.rerun()
 
 # ===== Auto-Re-Render nach Re-Run (kein Prompt aktiv) =========================
 if (('skip_agent_on_next_run' in st.session_state and not st.session_state['skip_agent_on_next_run']) or True) and st.session_state.get("last_code"):
