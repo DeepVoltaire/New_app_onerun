@@ -15,6 +15,8 @@ import streamlit as st
 import asyncio
 
 
+
+
 # ===== Pfade / Repo-Layout ====================================================
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
 KNOWLEDGE_DIR = BASE_DIR / "knowledge"
@@ -78,6 +80,18 @@ try:
 except Exception as e:
     AGENTS_OK = False
     AGENTS_IMPORT_ERROR = str(e)
+
+# --- Defaults, damit spätere Checks nie NameError werfen ---
+agent = None            # type: ignore
+builder_agent = None    # type: ignore
+refactor_agent = None   # type: ignore
+
+# OpenAI client früh initialisieren (nur wenn Agents-SDK importiert)
+try:
+    openai_client = AsyncOpenAI() if AGENTS_OK else None
+except NameError:
+    # Falls AsyncOpenAI im Importblock fehlte (AGENTS_OK False), einfach None
+    openai_client = None
 
 # ===== Prompt laden ===========================================================
 def load_text_file(path: pathlib.Path, fallback: str = "") -> str:
@@ -921,6 +935,7 @@ if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
+
 
 
 
