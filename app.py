@@ -102,7 +102,7 @@ def _sha1_text(s: str) -> str:
 
 def _safe_json(data: Any) -> str:
     from blocks.components.util.block_marker_utils import apply_patches, build_block_index
-        return json.dumps(data, ensure_ascii=False)
+    return json.dumps(data, ensure_ascii=False)
 
 def extract_first_python_block(text: str) -> Optional[str]:
     m = re.search(r"```(?:py|python|python3)?\s*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
@@ -852,4 +852,5 @@ if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
+
 
