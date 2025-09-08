@@ -598,14 +598,15 @@ def request_refactor(reason: Optional[str] = None) -> bool:
     return True
 
 
-    openai_client = AsyncOpenAI()  # nutzt OPENAI_API_KEY
-    agent = Agent(
-        name="EO-Agent",
-        instructions=MEGA_PROMPT,
-        tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python, request_structured_output, request_refactor],
-        model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
-        output_type=AgentOutputSchema(PlanSpecOnly, strict_json_schema=False),  # nur plan_spec
-    )
+# === Conversation/Chat-Agent (streaming, no strict schema) ===
+agent = Agent(
+    name="EO-Agent",
+    instructions=MEGA_PROMPT,
+    tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python, request_structured_output, request_refactor],
+    model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
+    output_type=AgentOutputSchema(PlanSpecOnly, strict_json_schema=False),
+)
+
 
 
 # === Builder-Agent für strukturierte Ausgabe (kein Streaming erforderlich) ===
@@ -935,6 +936,7 @@ if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
+
 
 
 
