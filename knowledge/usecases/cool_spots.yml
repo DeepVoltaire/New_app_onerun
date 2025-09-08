@@ -54,7 +54,6 @@ checks:
   - "Wenn die Bildsammlung leer ist: Hinweis ausgeben und Parameter prüfen."
 
 few_shot_components:
-  - "blocks/components/util/scaffold.py"
   - "blocks/components/gee/aoi_from_spec.py"
   - "blocks/components/gee/cool_spots_time.py"
   - "blocks/components/gee/cool_spots_acquire_process.py"
