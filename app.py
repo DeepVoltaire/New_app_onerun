@@ -9,6 +9,7 @@ import pathlib
 import subprocess
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel, Field
+from blocks.components.util.block_marker_utils import apply_patches, build_block_index
 
 import streamlit as st
 import asyncio
@@ -96,12 +97,64 @@ MEGA_PROMPT = load_text_file(
     )
 )
 
+# === Builder marker rules (safe string) ===
+BUILDER_MARKER_RULES = "\n".join([
+    "You MUST return code with explicit block annotations for every functional section.",
+    "Use Python comments as markers, exactly this format:",
+    "",
+    "# filemeta uc_id=<slug> version=1 spec_hash=<8-hex> generated_at=<YYYY-MM-DD>",
+    "",
+    "# region BLOCK id=<phase.component_id> kind=<acq|proc|viz|ui> phase=<L1|L2|L3|Acquire|Process|Visualize|UI> name=\"<human title>\" plan_ref=\"<plan.path>\" hash=<8-hex> modifiable=<yes|no>",
+    "... code for this block ...",
+    "# endregion BLOCK id=<phase.component_id>",
+    "",
+    "Rules:",
+    "- All executable code MUST lie inside regions; do NOT place executable code outside regions.",
+    "- The 'id' MUST be deterministic and stable across regenerations (e.g., \"acq.aoi_selector\").",
+    "- 'plan_ref' MUST match the node path in the planning spec (e.g., \"acquire.aoi\").",
+    "- 'hash' is an 8-hex content hash of the block body (no markers).",
+    "- If the user requests, set 'modifiable=yes' only for UI/viz or explicitly requested blocks; else 'no'.",
+    "- Do NOT include markdown fences in the code. Return plain Python only.",
+    "- Additionally, fill 'block_index' with an array of objects mirroring all blocks and their metadata.",
+])
+
+
+# === Refactor rules (safe string) ===
+REFACTOR_RULES = "\n".join([
+    "You are the Refactor Agent. The CURRENT_CODE is the single source of truth.",
+    "Return ONLY JSON conforming to the RefactorPatches schema (no extra keys, no prose).",
+    "",
+    "Markers:",
+    "# region BLOCK id=... kind=... phase=... plan_ref=\"...\" hash=... modifiable=...",
+    "...body...",
+    "# endregion BLOCK id=...",
+    "",
+    "Rules:",
+    "- Only modify blocks the user asks for OR blocks with modifiable=yes.",
+    "- Preserve public function signatures unless explicitly requested to change.",
+    "- Keep changes minimal; do not touch unrelated blocks.",
+    "- Each patch.new_code is the FULL body (between region markers), no markers and no markdown fences.",
+    "- Use old_hash when possible; if mismatched, still propose the best-effort patch and include notes.",
+    "- Do NOT create new blocks unless explicitly requested; if necessary, add a note requesting a re-index pass.",
+    "- Never emit code outside the patches array.",
+    "",
+    "Validation before emitting:",
+    "- Ensure each block_id exists in CURRENT_CODE.",
+    "- Ensure new_code is syntactically valid Python (best effort).",
+    "",
+    "Output example:",
+    "{ \"patches\": [ { \"block_id\": \"ui.controls\", \"new_code\": \"def render_controls(...):\n    ...\n\", \"old_hash\": \"17ac0b55\", \"notes\": \"raise radius max\" } ],",
+    "  \"user_markdown\": \"Kurz: Radius-Maximum auf 50km erhöht.\" }",
+])
+
+
+
+
 # ===== Hilfsfunktionen ========================================================
 def _sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
 
 def _safe_json(data: Any) -> str:
-    from blocks.components.util.block_marker_utils import apply_patches, build_block_index
     return json.dumps(data, ensure_ascii=False)
 
 def extract_first_python_block(text: str) -> Optional[str]:
@@ -115,10 +168,9 @@ def strip_fenced_code_blocks(text: str) -> str:
     if not isinstance(text, str) or "```" not in text:
         return text
 
-# === Builder marker rules (safe string) ===
-BUILDER_MARKER_RULES = "\n".join(["You MUST return code with explicit block annotations for every functional section.","Use Python comments as markers, exactly this format:","","# filemeta uc_id=<slug> version=1 spec_hash=<8-hex> generated_at=<YYYY-MM-DD>","","# region BLOCK id=<phase.component_id> kind=<acq|proc|viz|ui> phase=<L1|L2|L3|Acquire|Process|Visualize|UI> name=\"<human title>\" plan_ref=\"<plan.path>\" hash=<8-hex> modifiable=<yes|no>","... code for this block ...","# endregion BLOCK id=<phase.component_id>","","Rules:","- All executable code MUST lie inside regions; do NOT place executable code outside regions.","- The 'id' MUST be deterministic and stable across regenerations (e.g., \"acq.aoi_selector\").","- 'plan_ref' MUST match the node path in the planning spec (e.g., \"acquire.aoi\").","- 'hash' is an 8-hex content hash of the block body (no markers).","- If the user requests, set 'modifiable=yes' only for UI/viz or explicitly requested blocks; else 'no'.","- Do NOT include markdown fences in the code. Return plain Python only.","- Additionally, fill 'block_index' with an array of objects mirroring all blocks and their metadata."])
-
     return CODE_FENCE_RE.sub("", text).strip()
+
+
 
 def ensure_event_loop() -> None:
     """Event-Loop für Streamlit-Thread sicherstellen."""
@@ -474,6 +526,7 @@ if AGENTS_OK:
     try:
         PlanSpecOnly.model_rebuild()
     except Exception:
+        pass
 class UiPlanCode(BaseModel):
     """Structured output for builder: visible text + plan + code + block index."""
     user_markdown: str = Field(description="Visible user-facing markdown (no code fences).")
@@ -503,9 +556,18 @@ except Exception:
     pass
 
 
-        pass
 
 
+
+
+@function_tool(name="request_structured_output", description="Signalisiert, dass ein strukturierter Build (Plan/Code) gewünscht ist.")
+def request_structured_output(reason: Optional[str] = None, need_plan: bool = True, need_code: bool = True) -> bool:
+    # Flags nur im Session-State setzen; UI rendert dieses Tool nicht
+    st.session_state._want_structured = True
+    st.session_state._want_plan = bool(need_plan)
+    st.session_state._want_code = bool(need_code)
+    st.session_state._structured_reason = reason or ""
+    return True
 
 @function_tool(name="request_refactor", description="Signalisiert, dass Patches für den bestehenden, markierten Code erzeugt werden sollen.")
 def request_refactor(reason: Optional[str] = None) -> bool:
@@ -517,9 +579,7 @@ def request_refactor(reason: Optional[str] = None) -> bool:
     agent = Agent(
         name="EO-Agent",
         instructions=MEGA_PROMPT,
-        request_structured_output,
-        request_refactor,
-        tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python],
+        tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python, request_structured_output, request_refactor],
         model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
         output_type=AgentOutputSchema(PlanSpecOnly, strict_json_schema=False),  # nur plan_spec
     )
@@ -545,7 +605,7 @@ refactor_agent = Agent(
 )
 
 
-else:
+if not AGENTS_OK:
     agent = None
 
 if AGENTS_OK:
@@ -852,6 +912,3 @@ if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
-
-
-
