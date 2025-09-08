@@ -1,7 +1,7 @@
 from blocks.components.util.scaffold import ee_authenticate
 from blocks.components.gee.aoi_from_spec import aoi_from_spec
-from blocks.components.gee.summer_window import summer_window
-from blocks.components.gee.lst_acquire_process import build_lst_image
+from blocks.components.gee.cool_spots_time import summer_window
+from blocks.components.gee.cool_spots_acquire_process import build_lst_image
 
 ee_authenticate()
 aoi = aoi_from_spec({"type":"bbox","bbox":[11.4,48.0,11.8,48.3]})
