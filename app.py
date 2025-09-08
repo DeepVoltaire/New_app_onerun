@@ -80,6 +80,7 @@ try:
 except Exception as e:
     AGENTS_OK = False
     AGENTS_IMPORT_ERROR = str(e)
+from openai.types.responses import ResponseTextDeltaEvent
 
 # --- Defaults, damit spätere Checks nie NameError werfen ---
 agent = None            # type: ignore
@@ -356,6 +357,7 @@ def tool_bundle_components(components: List[str]) -> str:
     return _safe_json({"bundle": "\n".join(bundle_parts), "manifest": manifest})
 
 # --- Runner-Tool: interne Impl + Tool-Wrapper, mit EE/Path-Prelude ------------
+
 def _tool_run_python_impl(code: str,
                           filename: Optional[str] = None,
                           timeout_sec: int = 600,
@@ -410,10 +412,26 @@ def _tool_run_python_impl(code: str,
         "except Exception:\n"
         "    pass\n\n"
     )
-    code_with_prelude = ee_prelude + (code or "")
+
+    def _merge_with_future_first(user_code: str) -> str:
+        """Ensure 'from __future__ import annotations' stays on the very first line."""
+        try:
+            lines = (user_code or '').splitlines()
+            if lines and lines[0].strip() == "from __future__ import annotations":
+                # keep future import on line 1, then prelude, then rest
+                head = lines[0] + "\n" + ee_prelude + "\n" + "\n".join(lines[1:])
+                return head
+            return ee_prelude + (user_code or "")
+        except Exception:
+            return ee_prelude + (user_code or "")
+
+    # Write file: for preflight-only path, do NOT inject the prelude to avoid 'future' placement issues.
+    code_to_write = (code or "")
+    if not preflight_only:
+        code_to_write = _merge_with_future_first(code_to_write)
 
     target = SANDBOX_DIR / filename
-    target.write_text(code_with_prelude, encoding="utf-8")
+    target.write_text(code_to_write, encoding="utf-8")
 
     # Subprozess-Umgebung: Repo in PYTHONPATH + EE-Secrets weitergeben
     env = os.environ.copy()
@@ -428,8 +446,8 @@ def _tool_run_python_impl(code: str,
             env["EE_PROJECT"] = str(proj)
     except Exception:
         pass
-        # --- Neuer Preflight-Zweig: nur Syntax prüfen, keine Ausführung ---
-                              
+
+    # --- Neuer Preflight-Zweig: nur Syntax prüfen, keine Ausführung ---
     if preflight_only:
         try:
             proc = subprocess.run(
@@ -859,61 +877,89 @@ if prompt and not ui_only_rerun:
 
     ensure_event_loop()
 
-    result = Runner.run_sync(
+    
+    # 2) Agent 0 streamen (sichtbarer Chat-Text, keine Codefences)
+    from openai.types.responses import ResponseTextDeltaEvent as _RespDelta
+    result_stream = Runner.run_streamed(
         agent,
         input=(prompt + iteration_context),
         session=sdk_session,  # persistente Session
         max_turns=60,
     )
+    streamed_parts: List[str] = []
+    with st.chat_message("assistant"):
+        _holder = st.empty()
+        async def _stream_to_ui():
+            async for ev in result_stream.stream_events():
+                data = getattr(ev, "data", None)
+                if getattr(ev, "type", "") == "raw_response_event" and data and getattr(data, "type", "") == "response.output_text.delta":
+                    delta = getattr(data, "delta", None) or ""
+                    if delta:
+                        streamed_parts.append(delta)
+                        _holder.markdown("".join(streamed_parts))
+        ensure_event_loop()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(_stream_to_ui())
+    result = result_stream
+    visible_text = "".join(streamed_parts)
+    st.session_state.messages.append({"role": "assistant", "content": visible_text})
+    st.session_state["last_assistant_text"] = visible_text
 
-    # ===== Sichtbarer Text (ohne Code) & strukturierte Outputs bevorzugen =====
+    # ===== Sichtbarer Text & strukturierte Outputs =====
     out = getattr(result, "final_output", None)
 
-    # Sichtbaren Text holen (versch. Felder), dann PLAN_SPEC-JSON am Anfang ggf. entfernen
-    visible_text = ""
-    for attr in ("text", "final_output_text", "message", "output_text"):
-        v = getattr(result, attr, None)
-        if isinstance(v, str) and v.strip():
-            visible_text = v
-            break
-    if isinstance(out, str) and not visible_text:
-        visible_text = out
-
-    # Erst un-fenced JSON am Anfang entfernen (mögliche PLAN_SPEC-Leak)
-    visible_text, leading_obj = _strip_leading_plan_spec(visible_text)
-    try:
-        if leading_obj is not None and _looks_like_plan_spec(leading_obj):
-            st.session_state["last_plan_spec"] = leading_obj
-    except Exception:
-        pass
-
-    # Danach nochmals: PLAN_SPEC aus fenced-JSON entfernen (Fallback)
-    extracted, cleaned_text = _extract_plan_spec_from_text(visible_text)
-    if extracted is not None and _looks_like_plan_spec(extracted):
-        st.session_state["last_plan_spec"] = extracted
-        visible_text = cleaned_text
-
-    # PLAN_SPEC strukturiert lesen (bevor wir rendern)
+    # Falls der Builder (Agent 1) bereits strukturiert geantwortet hat:
     plan_spec_obj = None
-    if out is not None:
+    code_out = None
+    ui_text = None
+    if out is not None and not isinstance(out, str):
+        # Pydantic-Objekt UiPlanCode o. ä.
         plan_spec_obj = getattr(out, "plan_spec", None)
-    if plan_spec_obj is None and hasattr(result, "outputs") and isinstance(result.outputs, dict):
-        plan_spec_obj = result.outputs.get("plan_spec", None)
+        code_out = getattr(out, "code", None)
+        ui_text = getattr(out, "user_markdown", None)
+
+        if isinstance(ui_text, str) and ui_text.strip():
+            # Ersetze gestreamten Text durch den strukturierten User-Text
+            with st.chat_message("assistant"):
+                st.markdown(ui_text)
+            st.session_state.messages.append({"role": "assistant", "content": ui_text})
+            st.session_state["last_assistant_text"] = ui_text
+    else:
+        # out ist String → wir haben bereits visible_text gestreamt
+        ui_text = visible_text
+
+    # PLAN_SPEC strukturiert speichern (niemals anzeigen)
     try:
-        if plan_spec_obj is not None and _looks_like_plan_spec(plan_spec_obj):
+        if plan_spec_obj is not None:
             st.session_state["last_plan_spec"] = plan_spec_obj
     except Exception:
         pass
 
-    # 3) Assistant-Antwort rendern (Codefences ausblenden)
-    ui_answer = strip_fenced_code_blocks(visible_text or "")
-    with st.chat_message("assistant"):
-        st.markdown(ui_answer)
-    st.session_state.messages.append({"role": "assistant", "content": ui_answer})
-    st.session_state["last_assistant_text"] = ui_answer
-
-    # 4) Code → Self-Heal → Auto-Ausführen (silent). Struktur bevorzugt; Fallback: Markdown-Parsing
-    code_out = extract_first_python_block(visible_text or "")
+    # Wenn Agent 0 den Wunsch nach strukturiertem Build signalisiert hat → Builder-Agent ausführen
+    if st.session_state.get("_want_structured") and (code_out is None):
+        builder_result = Runner.run_sync(
+            builder_agent,
+            input=prompt,
+            session=sdk_session,
+            max_turns=40,
+        )
+        builder_out = getattr(builder_result, "final_output", None)
+        if builder_out is not None and not isinstance(builder_out, str):
+            plan_spec_obj = getattr(builder_out, "plan_spec", None) or plan_spec_obj
+            code_out = getattr(builder_out, "code", None)
+            ui_text2 = getattr(builder_out, "user_markdown", None)
+            if isinstance(ui_text2, str) and ui_text2.strip():
+                with st.chat_message("assistant"):
+                    st.markdown(ui_text2)
+                st.session_state.messages.append({"role": "assistant", "content": ui_text2})
+                st.session_state["last_assistant_text"] = ui_text2
+            try:
+                if plan_spec_obj is not None:
+                    st.session_state["last_plan_spec"] = plan_spec_obj
+            except Exception:
+                pass
+# 4) Code → Self-Heal → Auto-Ausführen (silent). Struktur bevorzugt; Fallback: Markdown-Parsing
+    code_out = code_out or extract_first_python_block(visible_text or "")
     if isinstance(code_out, str) and code_out.strip():
         st.session_state.last_code = code_out
 
@@ -998,7 +1044,7 @@ if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
         compiled = compile(st.session_state.last_code, "<autorender>", "exec")
         exec(compiled, ns, ns)
         if not st.session_state._runner_autorun_done:
-            _ = _tool_run_python_impl(st.session_state.last_code, mode="script")
+            _ = _tool_run_python_impl(st.session_state.last_code, mode="script", preflight_only=True)
             st.session_state._runner_autorun_done = True
             st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
