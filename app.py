@@ -85,54 +85,7 @@ def load_text_file(path: pathlib.Path, fallback: str = "") -> str:
 
 MEGA_PROMPT = load_text_file(
 # === Builder marker rules (appended to MEGA_PROMPT for builder runs) ==================
-BUILDER_MARKER_RULES = """
 
-
-# === Refactor rules (prompt for EO-Refactor) ============================================
-REFACTOR_RULES = """
-You are the Refactor Agent. The current code is the single source of truth.
-Your task: return ONLY patches for annotated regions using the JSON schema.
-
-Context:
-- The code is segmented with markers:
-  # region BLOCK id=... kind=... phase=... plan_ref="..." hash=... modifiable=...
-  ...body...
-  # endregion BLOCK id=...
-- Only change blocks that are requested by the user or are marked modifiable=yes.
-- Keep function signatures unless explicitly requested.
-- Do not reflow unrelated blocks.
-- Compute patches for the minimal set of blocks.
-
-Output (STRICT):
-- Return ONLY JSON per schema RefactorPatches.
-- For each patch: { block_id, new_code, old_hash? }
-- new_code must be the FULL body for that block (without the region markers).
-- No markdown fences in new_code.
-- Optionally include user_markdown with a short human summary; keep it concise.
-
-Validation:
-- Ensure every block_id exists in CURRENT_CODE (the model can parse markers).
-- Do not emit code outside patches.
-"""
-
-You MUST return code with explicit block annotations for every functional section.
-Use Python comments as markers, exactly this format:
-
-# filemeta uc_id=<slug> version=1 spec_hash=<8-hex> generated_at=<YYYY-MM-DD>
-
-# region BLOCK id=<phase.component_id> kind=<acq|proc|viz|ui> phase=<L1|L2|L3|Acquire|Process|Visualize|UI> name="<human title>" plan_ref="<plan.path>" hash=<8-hex> modifiable=<yes|no>
-... code for this block ...
-# endregion BLOCK id=<phase.component_id>
-
-Rules:
-- All executable code MUST lie inside regions; do NOT place executable code outside regions.
-- The 'id' MUST be deterministic and stable across regenerations (e.g., "acq.aoi_selector").
-- 'plan_ref' MUST match the node path in the planning spec (e.g., "acquire.aoi").
-- 'hash' is an 8-hex content hash of the block body (no markers).
-- If the user requests, set 'modifiable=yes' only for UI/viz or explicitly requested blocks; else 'no'.
-- Do NOT include markdown fences in the code. Return plain Python only.
-- Additionally, fill 'block_index' with an array of objects mirroring all blocks and their metadata.
-"""
 
     PROMPTS_DIR / "mega_prompt.md",
     fallback=(
@@ -161,6 +114,10 @@ def strip_fenced_code_blocks(text: str) -> str:
     """Entfernt alle Markdown-Code-Fences (```...```) – nur für die UI-Anzeige."""
     if not isinstance(text, str) or "```" not in text:
         return text
+
+# === Builder marker rules (safe string) ===
+BUILDER_MARKER_RULES = "\n".join(["You MUST return code with explicit block annotations for every functional section.","Use Python comments as markers, exactly this format:","","# filemeta uc_id=<slug> version=1 spec_hash=<8-hex> generated_at=<YYYY-MM-DD>","","# region BLOCK id=<phase.component_id> kind=<acq|proc|viz|ui> phase=<L1|L2|L3|Acquire|Process|Visualize|UI> name=\"<human title>\" plan_ref=\"<plan.path>\" hash=<8-hex> modifiable=<yes|no>","... code for this block ...","# endregion BLOCK id=<phase.component_id>","","Rules:","- All executable code MUST lie inside regions; do NOT place executable code outside regions.","- The 'id' MUST be deterministic and stable across regenerations (e.g., \"acq.aoi_selector\").","- 'plan_ref' MUST match the node path in the planning spec (e.g., \"acquire.aoi\").","- 'hash' is an 8-hex content hash of the block body (no markers).","- If the user requests, set 'modifiable=yes' only for UI/viz or explicitly requested blocks; else 'no'.","- Do NOT include markdown fences in the code. Return plain Python only.","- Additionally, fill 'block_index' with an array of objects mirroring all blocks and their metadata."])
+
     return CODE_FENCE_RE.sub("", text).strip()
 
 def ensure_event_loop() -> None:
