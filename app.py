@@ -930,6 +930,8 @@ if prompt and not ui_only_rerun:
 
     # Wenn Agent 0 den Wunsch nach strukturiertem Build signalisiert hat → Builder-Agent ausführen
     if st.session_state.get("_want_structured") and (code_out is None):
+        # Wichtig: Nach asyncio.run() existiert keine aktive Loop. Vor run_sync sicherstellen:
+        ensure_event_loop()
         builder_result = Runner.run_sync(
             builder_agent,
             input=prompt,
@@ -951,6 +953,9 @@ if prompt and not ui_only_rerun:
                     st.session_state["last_plan_spec"] = plan_spec_obj
             except Exception:
                 pass
+        # Flag zurücksetzen, damit nicht erneut ausgelöst wird
+        st.session_state._want_structured = False
+
     # 4) Code → Self-Heal → Auto-Ausführen (silent). Struktur bevorzugt; Fallback: Markdown-Parsing
     code_out = code_out or extract_first_python_block(visible_text or "")
     if isinstance(code_out, str) and code_out.strip():
