@@ -14,7 +14,6 @@ from blocks.components.util.block_marker_utils import apply_patches, build_block
 import streamlit as st
 import asyncio
 
-openai_client = AsyncOpenAI() if AGENTS_OK else None  # init early for builder/refactor agents
 
 # ===== Pfade / Repo-Layout ====================================================
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
@@ -75,6 +74,7 @@ try:
     from agents import Agent, Runner, function_tool, SQLiteSession, AgentOutputSchema
     from agents.models.openai_responses import OpenAIResponsesModel
     from openai import AsyncOpenAI
+    openai_client = AsyncOpenAI() if AGENTS_OK else None  # init early for builder/refactor agents
 except Exception as e:
     AGENTS_OK = False
     AGENTS_IMPORT_ERROR = str(e)
@@ -921,5 +921,6 @@ if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
+
 
 
