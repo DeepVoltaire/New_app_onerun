@@ -560,20 +560,27 @@ except Exception:
 
 
 
-@function_tool(name="request_structured_output", description="Signalisiert, dass ein strukturierter Build (Plan/Code) gewünscht ist.")
-def request_structured_output(reason: Optional[str] = None, need_plan: bool = True, need_code: bool = True) -> bool:
-    # Flags nur im Session-State setzen; UI rendert dieses Tool nicht
+@function_tool
+def request_structured_output(
+    reason: Optional[str] = None,
+    need_plan: bool = True,
+    need_code: bool = True,
+) -> bool:
+    """Signalisiert, dass ein strukturierter Build (Plan/Code) gewünscht ist."""
     st.session_state._want_structured = True
     st.session_state._want_plan = bool(need_plan)
     st.session_state._want_code = bool(need_code)
     st.session_state._structured_reason = reason or ""
     return True
 
-@function_tool(name="request_refactor", description="Signalisiert, dass Patches für den bestehenden, markierten Code erzeugt werden sollen.")
+
+@function_tool
 def request_refactor(reason: Optional[str] = None) -> bool:
+    """Signalisiert, dass Patches für den bestehenden, markierten Code erzeugt werden sollen."""
     st.session_state._want_refactor = True
     st.session_state._refactor_reason = reason or ""
     return True
+
 
     openai_client = AsyncOpenAI()  # nutzt OPENAI_API_KEY
     agent = Agent(
@@ -912,3 +919,4 @@ if (ui_only_rerun or not prompt) and st.session_state.get("last_code"):
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
+
