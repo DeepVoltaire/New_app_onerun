@@ -169,7 +169,7 @@ def tool_get_meta() -> str:
 
 @function_tool
 def tool_get_policy() -> str:
-    if not POLICY_PATH.exists():
+    if not META_INDEX_PATH.exists():
         return _safe_json({"error": f"policy not found: {POLICY_PATH}"})
     return POLICY_PATH.read_text(encoding="utf-8")
 
@@ -508,9 +508,21 @@ if AGENTS_OK:
         ),
         output_type=AgentOutputSchema(RefactorResponse, strict_json_schema=True),
     )
+
 # ===== Self-Heal / Fixer (separat, nur intern) ================================
 import sys as _sh_sys
 import io as _sh_io
+
+# --- Import-sicherer Shim: verhindert NameError, falls vorzeitig aufgerufen ---
+if "self_heal_until_runs" not in globals():
+    def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str, List[str]]:
+        """
+        Import-sicherer Minimal-Stub:
+        Wird NUR benötigt, falls an anderer Stelle (vor nachstehender echter Definition)
+        bereits auf self_heal_until_runs zugegriffen wird.
+        Führt KEINE Heilung aus, verhindert aber NameError beim Import.
+        """
+        return True, code_text, []
 
 DEFAULT_MAX_TURNS = 12
 
@@ -918,7 +930,6 @@ if prompt and not ui_only_rerun:
             st.session_state["last_suggestions"] = suggestions
 
         # Patches anwenden → Preflight → Autorender
-        # Patches anwenden → Preflight → Autorender
         handoff_done = False
         if patches:
             # 1) Patch-Objekte → dicts
@@ -932,7 +943,6 @@ if prompt and not ui_only_rerun:
                     patched = apply_patches(st.session_state.last_code, patches_dicts, strategy="body_only")
                     ok = preflight_and_switch(patched)
                     if ok:
-                        
                         # OPTIONAL: zukünftige Zusatzdaten übernehmen
                         if isinstance(patches_out, dict):
                             new_block_index = patches_out.get("block_index")
@@ -964,7 +974,6 @@ if prompt and not ui_only_rerun:
             st.session_state["skip_agent_on_next_run"] = True
             st.rerun()
 
-# ===== Auto-Re-Render nach Re-Run =============================================
 # ===== Auto-Re-Render nach Re-Run =============================================
 if st.session_state.get("last_code") and not st.session_state.get("_runner_autorun_done"):
     try:
