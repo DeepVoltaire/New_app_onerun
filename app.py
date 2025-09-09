@@ -104,11 +104,9 @@ def _ensure_future_annotations_first(text: str) -> str:
     ).lstrip("\n")
     return "from __future__ import annotations\n\n" + text_wo
 
-def sanitize_code(code_text: str) -> str:
-    """Robuste Sanitisierung für Agent/Fixer-Ausgaben."""
-    if not isinstance(code_text, str):
-        return code_text
-    s = code_text
+def sanitize_code(code_text: Any) -> str:
+    """Robuste Sanitisierung für Agent/Fixer-Ausgaben (extrahiert ggf. Code aus Tupeln/Dicts)."""
+    s = _extract_source(code_text)
 
     # 1) Region-Marker ohne Kommentarzeichen nachrüsten
     s = _normalize_region_markers(s)
@@ -128,6 +126,42 @@ def sanitize_code(code_text: str) -> str:
         s = _FROM_BLOCKS_IMPORT_RE.sub("", s)
 
     return s
+
+
+
+def _extract_source(maybe_code: Any) -> str:
+    """Robust: ziehe den eigentlichen Python-Quelltext aus diversen Container-Formen."""
+    # Bereits ein String?
+    if isinstance(maybe_code, str):
+        return maybe_code
+
+    # Bytes → decoden
+    if isinstance(maybe_code, (bytes, bytearray)):
+        try:
+            return maybe_code.decode("utf-8")
+        except Exception:
+            return maybe_code.decode("latin-1", errors="ignore")
+
+    # (code, meta...) oder [code, ...]
+    if isinstance(maybe_code, (list, tuple)):
+        for item in maybe_code:
+            if isinstance(item, str) and item.strip():
+                return item
+        # Fallback: stringify erstes Element
+        if maybe_code:
+            return str(maybe_code[0])
+
+    # Dict-Varianten
+    if isinstance(maybe_code, dict):
+        for key in ("code", "new_code", "source", "text", "content"):
+            val = maybe_code.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        # Fallback: toString
+        return json.dumps(maybe_code, ensure_ascii=False)
+
+    # Letzter Fallback: stringify
+    return str(maybe_code)
 
 # ===== Patch-/Marker-Helpers ===================================================
 _REGION_RE = re.compile(r"^\s*#\s*region\s+BLOCK\s+id\s*=", re.MULTILINE)
@@ -1116,3 +1150,4 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
         st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
+
