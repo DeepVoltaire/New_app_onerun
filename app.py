@@ -118,8 +118,9 @@ def _looks_like_full_program(snippet: str) -> bool:
 # ===== Code-Sanitizer (immer vor jedem Run anwenden) ==========================
 _SANITIZE_RULES: Tuple[Tuple[str, str], ...] = (
     (r"^\s*from\s+future\s+import\s+annotations", "from __future__ import annotations"),
-    (r"\bif\s+name\s*==\s*["]main["]\s*:", "if __name__ == \"__main__\":"),
+    (r"\bif\s+name\s*==\s*[\"']main[\"']\s*:", "if __name__ == \"__main__\":"),
 )
+
 
 
 def sanitize_agent_code(src: str) -> str:
@@ -1088,3 +1089,4 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
     except BaseException as e:
         st.sidebar.warning(f"Auto-Render fehlgeschlagen – {e.__class__.__name__}: {e}")
         st.exception(e)
+
