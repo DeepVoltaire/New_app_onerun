@@ -84,10 +84,13 @@ _SANITIZE_SIMPLE_RULES: Tuple[Tuple[str, str], ...] = (
     (r"\bif\s+name\s*==\s*[\"']main[\"']\s*:", 'if __name__ == "__main__":'),
 )
 
+# NEU: Entferne jegliche st.set_page_config(...) im generierten Code (Konflikt mit Top-Level-Aufruf)
+_SET_PAGE_CONFIG_RE = re.compile(r"(?m)^\s*st\.set_page_config\s*\(.*?\)\s*$")
+
 def _normalize_region_markers(text: str) -> str:
     # rohe "region BLOCK …" → "# region BLOCK …"
     text = re.sub(r"(?m)^(?P<pre>\s*)(region\s+BLOCK\s+id=)", r"\g<pre># \2", text)
-    # rohe "endregion BLOCK …" → "# endregion BLOCK …
+    # rohe "endregion BLOCK …" → "# endregion BLOCK …"
     text = re.sub(r"(?m)^(?P<pre>\s*)(endregion\s+BLOCK\s+id=)", r"\g<pre># \2", text)
     return text
 
@@ -124,6 +127,9 @@ def sanitize_code(code_text: Any) -> str:
     # 4) Redundante Komponenten-Imports entfernen, falls Bundle-Blöcke vorhanden
     if _COMPONENT_BEGIN_RE.search(s):
         s = _FROM_BLOCKS_IMPORT_RE.sub("", s)
+
+    # 5) NEU: Doppeltes Page-Config verhindern (fein – Zeile wird komplett entfernt)
+    s = _SET_PAGE_CONFIG_RE.sub("", s)
 
     return s
 
@@ -163,7 +169,7 @@ def _extract_source(maybe_code: Any) -> str:
     # Letzter Fallback: stringify
     return str(maybe_code)
 
-# ===== Patch-/Marker-Helpers ===================================================
+# ===== Patch-/Marker-Helpers ==================================================
 _REGION_RE = re.compile(r"^\s*#\s*region\s+BLOCK\s+id\s*=", re.MULTILINE)
 def _normalize_patches_list(patches_in) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -821,24 +827,30 @@ def autorender_now() -> None:
         ns: Dict[str, object] = {"__name__": "__generated__", "st": st}
         if ee is not None:
             ns["ee"] = ee
-        compiled = compile(st.session_state.last_code, "<autorender-now>", "exec")
-        exec(compiled, ns, ns)
 
-        entry = None
-        for fn_name in ("t2e_app", "render", "main"):
-            fn = ns.get(fn_name)
-            if callable(fn):
-                entry = fn
-                break
-        if entry is None:
-            raise RuntimeError("Autorender-now: Kein Entry-Point (t2e_app/render/main) gefunden.")
         try:
-            entry()
-        except TypeError:
-            entry(st)
+            compiled = compile(st.session_state.last_code, "<autorender-now>", "exec")
+            exec(compiled, ns, ns)
 
-    st.session_state._runner_autorun_done = True
+            entry = None
+            for fn_name in ("t2e_app", "render", "main"):
+                fn = ns.get(fn_name)
+                if callable(fn):
+                    entry = fn
+                    break
+            if entry is None:
+                raise RuntimeError("Autorender-now: Kein Entry-Point (t2e_app/render/main) gefunden.")
+            try:
+                entry()
+            except TypeError:
+                entry(st)
 
+            st.session_state._runner_autorun_done = True
+        except BaseException as e:
+            # NEU: Fehler sichtbar machen statt „stilles Nichts“
+            import traceback
+            st.error(f"Autorender fehlgeschlagen: {e.__class__.__name__}: {e}")
+            st.code("".join(traceback.format_exc()))
 
 # ---- NEU: Ephemere Vorschläge direkt über dem Eingabefeld --------------------
 def render_ephemeral_suggestions() -> None:
@@ -1148,6 +1160,8 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
 
         st.session_state._runner_autorun_done = True
         st.sidebar.caption("Runner automatisch gestartet.")
-    except BaseException:
+    except BaseException as e:
+        import traceback
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
-
+        st.error(f"Auto-Render Exception: {e.__class__.__name__}: {e}")
+        st.code("".join(traceback.format_exc()))
