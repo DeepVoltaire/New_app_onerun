@@ -1030,16 +1030,41 @@ if prompt and not ui_only_rerun:
         )
         patches_payload = getattr(ref_res, "final_output", None)
         if patches_payload and not isinstance(patches_payload, str):
-            # Sichtbar: optionales Refactor-Markdown aus dem JSON
-            user_md = patches_payload.get("user_markdown")
+            # 1) Sichtbaren Text aus dem Pydantic-Model lesen
+            user_md = getattr(patches_payload, "user_markdown", None)
             if isinstance(user_md, str) and user_md.strip():
                 with st.chat_message("assistant"):
                     st.markdown(user_md)
                 st.session_state.messages.append({"role": "assistant", "content": user_md})
                 st.session_state["last_assistant_text"] = user_md
-
-            patched_code = apply_patches(ctx["code"], patches_payload.get("patches", []), strategy="body_only")
+        
+            # 2) Patches robust extrahieren und in plain dicts konvertieren
+            raw_patches = getattr(patches_payload, "patches", []) or []
+            # raw_patches kann eine Liste aus PatchItem (Pydantic) sein → in dicts wandeln
+            norm_patches: List[Dict[str, Any]] = []
+            for p in raw_patches:
+                if hasattr(p, "model_dump"):
+                    norm_patches.append(p.model_dump())
+                elif isinstance(p, dict):
+                    norm_patches.append(p)
+                else:
+                    # Fallback: bestmöglich extrahieren
+                    try:
+                        norm_patches.append({
+                            "block_id": getattr(p, "block_id"),
+                            "new_code": getattr(p, "new_code"),
+                            "old_hash": getattr(p, "old_hash", None),
+                            "notes": getattr(p, "notes", None),
+                        })
+                    except Exception:
+                        # ignoriere unlesbare Einträge still
+                        pass
+        
+            # 3) Patches anwenden
+            patched_code = apply_patches(ctx["code"], norm_patches, strategy="body_only")
             st.session_state.builder_context["code"] = patched_code
+        
+            # 4) Preflight + Autorun
             ok = preflight_and_switch(patched_code)
             if ok:
                 handoff_done = True
@@ -1049,6 +1074,7 @@ if prompt and not ui_only_rerun:
         else:
             with st.chat_message("assistant"):
                 st.markdown("Ich konnte keine gültigen Patches erzeugen. Bitte beschreibe die gewünschte Änderung konkreter.")
+
 
     if handoff_done:
         st.session_state["skip_agent_on_next_run"] = True
@@ -1082,3 +1108,4 @@ if (('skip_agent_on_next_run' in st.session_state and not st.session_state['skip
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
+
