@@ -169,7 +169,8 @@ def tool_get_meta() -> str:
 
 @function_tool
 def tool_get_policy() -> str:
-    if not META_INDEX_PATH.exists():
+    # FIX: prüfe korrekt den Policy-Pfad (vorher: META_INDEX_PATH)
+    if not POLICY_PATH.exists():
         return _safe_json({"error": f"policy not found: {POLICY_PATH}"})
     return POLICY_PATH.read_text(encoding="utf-8")
 
@@ -808,26 +809,28 @@ def render_persistent_suggestions() -> None:
     if not isinstance(sugg, list) or not sugg:
         return
 
-    st.subheader("Vorschläge")
-    cols = st.columns(2)
-    for i, label in enumerate(sugg[:4]):
-        with cols[i % 2]:
-            if st.button(label, key=f"sugg_btn_{i}", use_container_width=True):
-                st.session_state["queued_input"] = label
-                st.session_state["last_suggestions"] = None
-                st.session_state["skip_agent_on_next_run"] = False
-                st.rerun()
+    with st.chat_message("assistant"):
+        st.subheader("Vorschläge")
+        cols = st.columns(2)
+        for i, label in enumerate(sugg[:4]):
+            with cols[i % 2]:
+                if st.button(label, key=f"sugg_btn_{i}", use_container_width=True):
+                    st.session_state["queued_input"] = label
+                    st.session_state["last_suggestions"] = None
+                    st.session_state["skip_agent_on_next_run"] = False
+                    st.rerun()
 
 # Persistente Vorschläge immer anzeigen (falls vorhanden)
 render_persistent_suggestions()
 
-# Eingabe
-queued = st.session_state.get("queued_input")
-if queued:
+# Eingabe — FIX: chat_input IMMER rendern, queued hat nur Priorität
+_new_input = st.chat_input("Nachricht eingeben…")
+_queued = st.session_state.get("queued_input")
+if _queued:
+    prompt = _queued
     st.session_state["queued_input"] = None
-    prompt = queued
 else:
-    prompt = st.chat_input("Nachricht eingeben…")
+    prompt = _new_input
 
 # Verliere keine Eingabe im UI-only Rerun: Puffer + sofort rerun
 if ui_only_rerun and prompt:
@@ -891,11 +894,11 @@ if prompt and not ui_only_rerun:
         handoff_done = False
         attempted_build = False
         ok = False
-        
+
         if isinstance(code_text, str) and code_text.strip():
             attempted_build = True
             ok = preflight_and_switch(code_text)
-        
+
         if attempted_build:
             if ok:
                 handoff_done = True
@@ -903,7 +906,6 @@ if prompt and not ui_only_rerun:
                 with st.chat_message("assistant"):
                     st.markdown("Ich hatte gerade ein Problem mit dem Code – ich versuche, es automatisch zu reparieren.")
         # Wenn kein Build versucht wurde (kein code_text), hier NICHTS anzeigen.
-
 
         if handoff_done:
             st.session_state["skip_agent_on_next_run"] = True
@@ -957,10 +959,10 @@ if prompt and not ui_only_rerun:
         if patches:
             # 1) Patch-Objekte → dicts
             patches_dicts = _normalize_patches_list(patches)
-        
+
             # 2) Pfad A: Marker-basiertes Patchen (empfohlen)
             try_marker = _has_region_markers(st.session_state.last_code)
-        
+
             try:
                 if try_marker:
                     patched = apply_patches(st.session_state.last_code, patches_dicts, strategy="body_only")
@@ -1024,4 +1026,3 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
         st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
-
