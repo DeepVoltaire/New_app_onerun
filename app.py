@@ -70,30 +70,6 @@ def ensure_event_loop() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-# Sanitizer für Agent-Code (greift vor jedem Preflight/Heal/Switch)
-_SANITIZE_FUTURE_BAD = re.compile(r"^\s*from\s+future\s+import\s+annotations\s*$", re.MULTILINE)
-_SANITIZE_GUARD_BAD  = re.compile(r"^\s*if\s+name\s*==\s*[\"']main[\"']\s*:\s*$", re.MULTILINE)
-_SANITIZE_BLOCKS_IMPORTS = re.compile(
-    r"^\s*(from\s+blocks\.components[^\n]*\s+import[^\n]*|import\s+blocks\.components[^\n]*)\s*$",
-    re.MULTILINE
-)
-
-def _sanitize_agent_code(code: str) -> str:
-    s = code or ""
-    # 1) future → __future__
-    s = _SANITIZE_FUTURE_BAD.sub("from __future__ import annotations", s)
-    # Sicherstellen, dass __future__ ganz oben steht (falls gar nicht vorhanden)
-    if "from __future__ import annotations" not in s.splitlines()[0:1]:
-        s = "from __future__ import annotations\n" + s
-
-    # 2) Guard korrigieren
-    s = _SANITIZE_GUARD_BAD.sub('if __name__ == "__main__":', s)
-
-    # 3) In-Repo-Imports entfernen (Komponenten sind bereits im selben File gebündelt)
-    s = _SANITIZE_BLOCKS_IMPORTS.sub("", s)
-
-    return s
-
 
 # ===== Patch-/Marker-Helpers ===================================================
 def _normalize_patches_list(patches_in) -> List[Dict[str, Any]]:
@@ -121,12 +97,15 @@ def _looks_like_full_program(snippet: str) -> bool:
     if not isinstance(snippet, str):
         return False
     s = snippet.strip()
+    # typische Artefakte für Vollcode
     return (
         s.startswith("from __future__ import annotations")
         or s.startswith("import ")
         or "def main(" in s
         or "# ==== BUNDLED COMPONENTS BEGIN ====" in s
     )
+
+
 
 # ===== Earth Engine (Host-Init) ===============================================
 EE_OK = True
@@ -190,7 +169,6 @@ def tool_get_meta() -> str:
 
 @function_tool
 def tool_get_policy() -> str:
-    # BUGFIX: richtiger Pfad-Check
     if not POLICY_PATH.exists():
         return _safe_json({"error": f"policy not found: {POLICY_PATH}"})
     return POLICY_PATH.read_text(encoding="utf-8")
@@ -202,7 +180,7 @@ def tool_get_uc_sections(uc_id: str, sections: List[str]) -> str:
     except Exception:
         return _safe_json({
             "error": "missing_dependency",
-            "detail": "PyYAML is required. Add 'pyyaml' to requirements.txt."
+            "detail": "PyYAML ist erforderlich. Füge 'pyyaml' zu requirements.txt hinzu."
         })
     uc_path = USECASES_DIR / f"{uc_id}.yml"
     if not uc_path.exists():
@@ -659,6 +637,8 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
     return ok_out, text_out
 
 
+
+
 def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str, List[str]]:
     logs: List[str] = []
     current = code_text
@@ -675,6 +655,28 @@ def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str
     logs.append(out)
     return ok, current, logs
 
+def preflight_and_switch(code_text: str) -> bool:
+    ok, final_code, _heal = self_heal_until_runs(code_text, max_rounds=5)
+    if not ok:
+        return False
+
+    # neuen Code als SoT setzen
+    st.session_state.last_code = final_code
+    st.session_state._runner_autorun_done = False
+    st.session_state.build_completed = True
+    st.session_state.refactor_mode = True
+
+    # >>> sofort sichtbar im festen Platzhalter rendern
+    #    (stellt sicher, dass alte Mini-App überschrieben wird)
+    try:
+        autorender_now()
+    except Exception:
+        # Autorender-Fehler nicht fatal fürs Preflight-Ergebnis
+        return False
+
+    return True
+
+
 # ===== Session / SDK-Session ==================================================
 if AGENTS_OK:
     try:
@@ -684,6 +686,7 @@ if AGENTS_OK:
             SESSIONS_DB = str((RUNNER_DIR / "sessions.db").resolve())
             st.session_state.sdk_session = SQLiteSession(st.session_state.agent_session_id, SESSIONS_DB)
     except Exception:
+        # Fallback *persistiert* ebenfalls im Session State (verhindert Neuaufbau pro Run)
         if "sdk_session" not in st.session_state:
             st.session_state.sdk_session = SQLiteSession(st.session_state.agent_session_id)  # in-memory fallback
     sdk_session = st.session_state.sdk_session
@@ -691,6 +694,7 @@ else:
     sdk_session = None  # type: ignore
 
 # ===== UI =====================================================================
+
 
 def autorender_now() -> None:
     """Führt den aktuellen last_code *im render_slot* aus (ersetzt alte Anzeige)."""
@@ -722,6 +726,27 @@ def autorender_now() -> None:
 
     st.session_state._runner_autorun_done = True
 
+
+# ---- NEU: Ephemere Vorschläge direkt über dem Eingabefeld --------------------
+def render_ephemeral_suggestions() -> None:
+    """Zeigt aktuelle Vorschläge (falls vorhanden) als Buttons direkt über dem Eingabefeld.
+    Klick -> queued_input setzen, Vorschläge leeren, sofortiger rerun.
+    """
+    sugg = st.session_state.get("current_suggestions") or []
+    if not isinstance(sugg, list) or not sugg:
+        return
+
+    st.subheader("Vorschläge")
+    cols = st.columns(2)
+    for i, label in enumerate(sugg[:4]):
+        with cols[i % 2]:
+            if st.button(label, key=f"ep_sugg_{i}", use_container_width=True):
+                st.session_state["queued_input"] = label
+                st.session_state["current_suggestions"] = []
+                st.session_state["skip_agent_on_next_run"] = False
+                st.rerun()
+
+
 st.set_page_config(page_title="talk2earth — EO Agent", layout="wide")
 st.title("talk2earth — EO Agent (Agents SDK + Streamlit)")
 
@@ -731,17 +756,9 @@ with st.sidebar:
     st.write("OPENAI_API_KEY gesetzt:", "✅" if os.environ.get("OPENAI_API_KEY") else "❌")
     st.write(f"Earth Engine: {'✅' if _EE_READY else '❌'}")
     st.divider()
-    # Self-Heal Switch
-    mode = st.selectbox(
-        "Self-Heal-Modus",
-        options=["Voll (Preflight+Fixer)", "Nur Preflight", "Aus"],
-        index=0,
-        help="Steuert den Build-Pfad: Voll = Sandbox-Run + Auto-Fix; Nur Preflight = Sandbox-Run ohne Reparatur; Aus = Code direkt übernehmen."
-    )
-    st.session_state["self_heal_mode"] = {"Voll (Preflight+Fixer)": "full", "Nur Preflight": "preflight", "Aus": "off"}[mode]
     st.caption("Antwortformat: Markdown + Suggestions + JSON (intern) + Code (unsichtbarer Preflight).")
 
-# Zentraler Render-Platzhalter
+# Zentraler Render-Platzhalter, in den die Mini-App *immer* gerendert wird
 if "render_slot" not in st.session_state:
     st.session_state.render_slot = st.empty()
 
@@ -762,10 +779,9 @@ if "refactor_mode" not in st.session_state:
     st.session_state.refactor_mode = False
 if "build_completed" not in st.session_state:
     st.session_state.build_completed = False
-if "last_suggestions" not in st.session_state:
-    st.session_state.last_suggestions = None
-if "sdk_session" not in st.session_state:
-    st.session_state.sdk_session = None
+# NEU: ephemere Vorschläge
+if "current_suggestions" not in st.session_state:
+    st.session_state.current_suggestions = []
 
 # --- UI-only Rerun Handling (einmalige Entkopplung des Autorender-Reruns) ---
 ui_only_rerun = False
@@ -778,46 +794,8 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-def render_suggestions(suggestions: Optional[List[str]]) -> Optional[str]:
-    if not suggestions:
-        return None
-    s = [x for x in suggestions if isinstance(x, str) and x.strip()][:4]
-    if not s:
-        return None
-
-    selected: Optional[str] = None
-    # Nonce pro Aufruf, verhindert Duplicate Keys bei Mehrfach-Render
-    nonce = uuid.uuid4().hex[:8]
-    with st.chat_message("assistant"):
-        st.subheader("Vorschläge")
-        cols = st.columns(2)
-        for i, label in enumerate(s):
-            with cols[i % 2]:
-                with st.container(border=True):
-                    st.markdown(label)
-                    if st.button("Auswählen", key=f"sugg_{nonce}_{i}", use_container_width=True):
-                        selected = label
-    return selected
-
-def render_persistent_suggestions() -> None:
-    """Zeigt ggf. zuletzt empfangene Vorschläge (persistiert) und setzt bei Klick queued_input."""
-    sugg = st.session_state.get("last_suggestions") or []
-    if not isinstance(sugg, list) or not sugg:
-        return
-
-    nonce = uuid.uuid4().hex[:8]  # Nonce pro Render verhindert Duplicate Keys
-    st.subheader("Vorschläge")
-    cols = st.columns(2)
-    for i, label in enumerate(sugg[:4]):
-        with cols[i % 2]:
-            if st.button(label, key=f"sugg_btn_{nonce}_{i}", use_container_width=True):
-                st.session_state["queued_input"] = label
-                st.session_state["last_suggestions"] = None
-                st.session_state["skip_agent_on_next_run"] = False
-                st.rerun()
-
-# Persistente Vorschläge immer oben zeigen (falls vorhanden)
-render_persistent_suggestions()
+# ---- Ephemere Vorschläge (direkt über dem Eingabefeld) -----------------------
+render_ephemeral_suggestions()
 
 # Eingabe
 queued = st.session_state.get("queued_input")
@@ -827,75 +805,16 @@ if queued:
 else:
     prompt = st.chat_input("Nachricht eingeben…")
 
-# Verliere keine Eingabe im UI-only Rerun
+# Verliere keine Eingabe im UI-only Rerun: Puffer + sofort rerun
 if ui_only_rerun and prompt:
     st.session_state["queued_input"] = prompt
     st.session_state["skip_agent_on_next_run"] = False
     st.rerun()
 
-# ===== Build/Refactor Routing =================================================
-def _post_agent_show_suggestions_now(suggestions: Optional[List[str]]):
-    """Persistiert Suggestions und triggert sofortigen Refresh, damit Buttons *sofort* sichtbar sind."""
-    if isinstance(suggestions, list) and suggestions:
-        st.session_state["last_suggestions"] = suggestions
-        st.session_state["skip_agent_on_next_run"] = False
-        st.rerun()
-
-def preflight_and_switch(code_text: str) -> bool:
-    """Schaltet je nach Self-Heal-Modus den richtigen Pfad."""
-    mode = st.session_state.get("self_heal_mode", "full")
-    # 1) Sanitizing vor JEDEM Pfad
-    sanitized = _sanitize_agent_code(code_text)
-
-    if mode == "off":
-        # Keine Prüfung/Reparatur: direkt übernehmen und rendern (mit Schutz)
-        try:
-            # Zweite Sanitätsschicht zur Sicherheit
-            final_code = _sanitize_agent_code(sanitized)
-            st.session_state.last_code = final_code
-            st.session_state._runner_autorun_done = False
-            st.session_state.build_completed = True
-            st.session_state.refactor_mode = True
-            autorender_now()
-            return True
-        except BaseException as e:
-            with st.chat_message("assistant"):
-                st.error(f"Code konnte nicht direkt ausgeführt werden: {e!r}")
-            return False
-
-    if mode == "preflight":
-        ok, log = _sh_sandbox_exec(sanitized)
-        if not ok:
-            with st.chat_message("assistant"):
-                st.warning("Preflight schlug fehl – Reparatur ist deaktiviert. Bitte Parameter anpassen oder Self-Heal aktivieren.")
-            return False
-        # zweite Sanitätsschicht
-        final_code = _sanitize_agent_code(sanitized)
-        st.session_state.last_code = final_code
-        st.session_state._runner_autorun_done = False
-        st.session_state.build_completed = True
-        st.session_state.refactor_mode = True
-        autorender_now()
-        return True
-
-    # mode == "full": Preflight + Auto-Fix Loop
-    ok, final_code, _heal_logs = self_heal_until_runs(sanitized, max_rounds=5)
-    # zweite Sanitätsschicht (auch nach Fixer)
-    final_code = _sanitize_agent_code(final_code)
-    if not ok:
-        return False
-
-    st.session_state.last_code = final_code
-    st.session_state._runner_autorun_done = False
-    st.session_state.build_completed = True
-    st.session_state.refactor_mode = True
-    try:
-        autorender_now()
-    except Exception:
-        return False
-    return True
-
 if prompt and not ui_only_rerun:
+    # Wenn echte Eingabe startet, alte Vorschläge verwerfen (ephemer)
+    st.session_state["current_suggestions"] = []
+
     # User Nachricht
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -939,10 +858,13 @@ if prompt and not ui_only_rerun:
                 st.markdown(user_md)
             st.session_state.messages.append({"role": "assistant", "content": user_md})
 
-        # 2) suggestions → sofort zeigen (persist + rerun)
-        _post_agent_show_suggestions_now(suggestions)
+        # 2) suggestions → sofort ephemer anzeigen (gleicher Run)
+        if isinstance(suggestions, list) and suggestions:
+            st.session_state["current_suggestions"] = [s for s in suggestions if isinstance(s, str) and s.strip()][:4]
+            # direkt rendern, ohne Rerun
+            render_ephemeral_suggestions()
 
-        # 3) JSON persistieren
+        # 3) JSON → nur persistieren (kann plan_spec, block_index, components_manifest enthalten)
         if isinstance(json_obj, dict):
             st.session_state["last_json"] = json_obj
 
@@ -960,7 +882,7 @@ if prompt and not ui_only_rerun:
                 handoff_done = True
             else:
                 with st.chat_message("assistant"):
-                    st.markdown("Ich hatte gerade ein Problem mit dem Code – je nach Self-Heal-Modus wurde nicht repariert oder die Reparatur war nicht erfolgreich.")
+                    st.markdown("Ich hatte gerade ein Problem mit dem Code – ich versuche, es automatisch zu reparieren.")
 
         if handoff_done:
             st.session_state["skip_agent_on_next_run"] = True
@@ -972,6 +894,7 @@ if prompt and not ui_only_rerun:
             st.error("Refactor-Agent nicht initialisiert.")
             st.stop()
 
+        # Kontext für Agent 2 zusammenstellen
         ctx_json = st.session_state.get("last_json") or {}
         ctx_payload = {
             "user_change_request": prompt,
@@ -1004,8 +927,10 @@ if prompt and not ui_only_rerun:
                 st.markdown(user_md)
             st.session_state.messages.append({"role": "assistant", "content": user_md})
 
-        # Vorschläge → sofort zeigen
-        _post_agent_show_suggestions_now(suggestions)
+        # Vorschläge → sofort ephemer anzeigen (gleicher Run)
+        if isinstance(suggestions, list) and suggestions:
+            st.session_state["current_suggestions"] = [s for s in suggestions if isinstance(s, str) and s.strip()][:4]
+            render_ephemeral_suggestions()
 
         # Patches anwenden → Preflight → Autorender
         handoff_done = False
@@ -1018,6 +943,7 @@ if prompt and not ui_only_rerun:
                     patched = apply_patches(st.session_state.last_code, patches_dicts, strategy="body_only")
                     ok = preflight_and_switch(patched)
                     if ok:
+                        # OPTIONAL: neuen block_index übernehmen, falls vorhanden
                         if isinstance(patches_out, dict):
                             new_block_index = patches_out.get("block_index")
                             if new_block_index:
@@ -1027,7 +953,7 @@ if prompt and not ui_only_rerun:
                         handoff_done = True
                     else:
                         with st.chat_message("assistant"):
-                            st.markdown("Die Änderung führte zu Laufzeitfehlern — je nach Self-Heal-Modus konnte nicht repariert werden.")
+                            st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
                 else:
                     if len(patches_dicts) == 1 and _looks_like_full_program(patches_dicts[0]["new_code"]):
                         full_code = patches_dicts[0]["new_code"]
@@ -1036,7 +962,7 @@ if prompt and not ui_only_rerun:
                             handoff_done = True
                         else:
                             with st.chat_message("assistant"):
-                                st.markdown("Die Änderung führte zu Laufzeitfehlern — je nach Self-Heal-Modus konnte nicht repariert werden.")
+                                st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
                     else:
                         raise RuntimeError("Keine Block-Marker gefunden und Patch ist kein Vollcode – kann nicht anwenden.")
             except Exception as e:
