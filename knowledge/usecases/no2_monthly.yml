@@ -59,7 +59,6 @@ checks:
   - "Wenn das Monatsfenster keine Bilder enthält: Hinweis anzeigen (Monat/Region prüfen)."
 
 few_shot_components:
-  - "blocks/components/util/scaffold.py"
   - "blocks/components/gee/aoi_from_spec.py"
   - "blocks/components/gee/no2_acquire_reduce.py"
   - "blocks/components/visual/split_map_right.py"
