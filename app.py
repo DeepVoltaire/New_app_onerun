@@ -624,6 +624,38 @@ else:
     sdk_session = None  # type: ignore
 
 # ===== UI =====================================================================
+
+
+def autorender_now() -> None:
+    """Führt den aktuellen last_code sofort im sichtbaren Streamlit-Run aus."""
+    try:
+        import ee  # falls oben im Scope
+    except Exception:
+        ee = None  # noqa: F401
+    ns: Dict[str, object] = {"__name__": "__generated__", "st": st}
+    if ee is not None:
+        ns["ee"] = ee
+    compiled = compile(st.session_state.last_code, "<autorender-now>", "exec")
+    exec(compiled, ns, ns)
+
+    entry = None
+    for fn_name in ("t2e_app", "render", "main"):
+        fn = ns.get(fn_name)
+        if callable(fn):
+            entry = fn
+            break
+    if entry is None:
+        raise RuntimeError("Autorender-now: Kein Entry-Point (t2e_app/render/main) gefunden.")
+    try:
+        entry()
+    except TypeError:
+        entry(st)
+
+    st.session_state._runner_autorun_done = True
+
+
+
+
 st.set_page_config(page_title="talk2earth — EO Agent", layout="wide")
 st.title("talk2earth — EO Agent (Agents SDK + Streamlit)")
 
@@ -751,10 +783,13 @@ if prompt and not ui_only_rerun:
         if isinstance(code_text, str) and code_text.strip():
             ok = preflight_and_switch(code_text)
             if ok:
+                # NEU: sofort rendern, damit die Mini-App unmittelbar sichtbar wird
+                autorender_now()
                 handoff_done = True
             else:
                 with st.chat_message("assistant"):
                     st.markdown("Ich behebe Laufzeitfehler intern und starte automatisch neu, sobald stabil.")
+
 
         if handoff_done:
             st.session_state["skip_agent_on_next_run"] = True
@@ -813,8 +848,18 @@ if prompt and not ui_only_rerun:
                 patched = apply_patches(st.session_state.last_code, patches, strategy="body_only")
                 ok = preflight_and_switch(patched)
                 if ok:
-                    # Kontext bleibt in last_json; falls Agent 2 neue block_index o.ä. liefern sollte,
-                    # kann MEGA_PROMPT künftig das in user json signalisieren. Hier keine Anzeige.
+                    # NEU: sofort rendern, damit die Aktualisierung direkt sichtbar ist
+                    autorender_now()
+        
+                    # OPTIONAL: falls der Refactor-Agent künftig neue Index/Plan-Daten mitschickt
+                    # (hier nur gesetzt, wenn vorhanden – keine Anzeige!)
+                    if isinstance(patches_out, dict):
+                        new_block_index = patches_out.get("block_index")
+                        if new_block_index:
+                            if not st.session_state.get("last_json"):
+                                st.session_state["last_json"] = {}
+                            st.session_state["last_json"]["block_index"] = new_block_index
+        
                     handoff_done = True
                 else:
                     with st.chat_message("assistant"):
@@ -822,6 +867,7 @@ if prompt and not ui_only_rerun:
             except Exception as e:
                 with st.chat_message("assistant"):
                     st.markdown(f"Patch-Anwendung fehlgeschlagen: {e!r}. Bitte Wünsche etwas konkreter formulieren.")
+
 
         if handoff_done:
             st.session_state["skip_agent_on_next_run"] = True
@@ -852,5 +898,6 @@ if st.session_state.get("last_code"):
             st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
+
 
 
