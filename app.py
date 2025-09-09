@@ -9,11 +9,11 @@ import pathlib
 import subprocess
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel, Field
+
 from blocks.components.util.block_marker_utils import apply_patches, build_block_index
 
 import streamlit as st
 import asyncio
-
 
 # ===== Pfade / Repo-Layout ====================================================
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
@@ -27,69 +27,16 @@ RUNNER_DIR = BASE_DIR / "runner"
 SANDBOX_DIR = RUNNER_DIR / "sandbox"
 SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
 
-# ===== Parser & UI: Bullets → Buttons (alle: •, -, *) =========================
-BULLET_RE = re.compile(r'^\s*([•\-\*])\s+(.+)$')
-
-def parse_suggestions_from_text(text: str) -> List[str]:
-    """Extrahiert alle Bullet-Zeilen (•, -, *) als Vorschläge (exakter Text)."""
-    if not isinstance(text, str) or not text.strip():
-        return []
-    items: List[str] = []
-    for line in text.splitlines():
-        m = BULLET_RE.match(line)
-        if m:
-            label = m.group(2).strip()
-            if label:
-                items.append(label)
-    # Duplikate entfernen, Reihenfolge bewahren
-    seen: set[str] = set()
-    uniq: List[str] = []
-    for it in items:
-        if it not in seen:
-            uniq.append(it)
-            seen.add(it)
-    return uniq
-
-def render_suggestions_from_text(assistant_text: str) -> Optional[str]:
-    """
-    Rendert alle erkannten Bullets als Karten mit vollem Text und 'Auswählen'-Button.
-    Rückgabe: der ausgewählte Text (oder None).
-    """
-    suggs = parse_suggestions_from_text(assistant_text)
-    if not suggs:
-        return None
-    st.subheader("Vorschläge")
-    cols = st.columns(2)
-    for i, label in enumerate(suggs):
-        with cols[i % 2]:
-            with st.container(border=True):
-                st.markdown(label)
-                if st.button("Auswählen", key=f"sugg_{i}", use_container_width=True):
-                    return label
-    return None
-
-# ===== Agents SDK korrekt importieren =========================================
+# ===== Agents SDK import ======================================================
 AGENTS_OK = True
 try:
     from agents import Agent, Runner, function_tool, SQLiteSession, AgentOutputSchema
     from agents.models.openai_responses import OpenAIResponsesModel
     from openai import AsyncOpenAI
-    from openai.types.responses import ResponseTextDeltaEvent
-    openai_client = AsyncOpenAI() if AGENTS_OK else None  # init early for builder/refactor agents
+    openai_client = AsyncOpenAI() if AGENTS_OK else None
 except Exception as e:
     AGENTS_OK = False
     AGENTS_IMPORT_ERROR = str(e)
-
-# --- Defaults, damit spätere Checks nie NameError werfen ---
-agent0 = None            # type: ignore
-builder_agent = None     # type: ignore
-refactor_agent = None    # type: ignore
-
-# OpenAI client früh initialisieren (nur wenn Agents-SDK importiert)
-try:
-    openai_client = AsyncOpenAI() if AGENTS_OK else None
-except NameError:
-    # Falls AsyncOpenAI im Importblock fehlte (AGENTS_OK False), einfach None
     openai_client = None
 
 # ===== Prompt laden ===========================================================
@@ -109,124 +56,19 @@ MEGA_PROMPT = load_text_file(
     )
 )
 
-# === Kleine Rollen-Addenda (auf Basis des Mega-Prompts) =======================
-AGENT0_ADDENDUM = """
-[Rollen-Zusatz · Agent 0]
-- Sichtbarer Gesprächsführer (Markdown), niemals Code/JSON anzeigen.
-- Vor erstem Build: an Builder (Agent 1) übergeben.
-- Nach erstem erfolgreichen Build: alle Folge-Turns sind Refactor-Turns (Agent 2 übernimmt fachliche Änderungen).
-- Wenn die Stop-Kriterien (Mega-Prompt §12/§15) erfüllt sind: Rufe das Tool request_structured_output(reason="build", need_plan=True, need_code=True).
-"""
-
-BUILDER_ADDENDUM = """
-[Rollen-Zusatz · Agent 1 (Builder)]
-- Liefere ausschließlich UiPlanCode (Structured Output):
-  plan_spec (nur intern), code (vollständige Python-Datei mit Block-Markern & Entry-Point),
-  block_index, components_manifest, user_markdown (einziger sichtbarer Text).
-- Keine EE-Auth im Code, keine Import-Side-Effects.
-"""
-
-REFACTOR_ADDENDUM = """
-[Rollen-Zusatz · Agent 2 (Refactor)]
-- Führe Gespräch sichtbar (Markdown) fort.
-- Gib ausschließlich RefactorPatches als Structured Output aus (nur Block-Bodies patchen; kein Vollcode).
-- Nutzer sieht niemals Code oder JSON.
-"""
-
-# === Builder marker rules (safe string) ===
-BUILDER_MARKER_RULES = "\n".join([
-    "You MUST return code with explicit block annotations for every functional section.",
-    "Use Python comments as markers, exactly this format:",
-    "",
-    "# filemeta uc_id=<slug> version=1 spec_hash=<8-hex> generated_at=<YYYY-MM-DD>",
-    "",
-    "# region BLOCK id=<phase.component_id> kind=<acq|proc|viz|ui> phase=<L1|L2|L3|Acquire|Process|Visualize|UI> name=\"<human title>\" plan_ref=\"<plan.path>\" hash=<8-hex> modifiable=<yes|no>",
-    "... code for this block ...",
-    "# endregion BLOCK id=<phase.component_id>",
-    "",
-    "Rules:",
-    "- All executable code MUST lie inside regions; do NOT place executable code outside regions.",
-    "- The 'id' MUST be deterministic and stable across regenerations (e.g., \"acq.aoi_selector\").",
-    "- 'plan_ref' MUST match the node path in the planning spec (e.g., \"acquire.aoi\").",
-    "- 'hash' is an 8-hex content hash of the block body (no markers).",
-    "- If the user requests, set 'modifiable=yes' only for UI/viz or explicitly requested blocks; else 'no'.",
-    "- Do NOT include markdown fences in the code. Return plain Python only.",
-    "- Additionally, fill 'block_index' with an array of objects mirroring all blocks and their metadata.",
-    "- Provide a callable entrypoint def main(): all Streamlit/geemap rendering happens inside main(); do not render at import time.",
-])
-
-# === Refactor rules (safe string) ===
-REFACTOR_RULES = "\n".join([
-    "You are the Refactor Agent. The CURRENT_CODE is the single source of truth.",
-    "Return ONLY JSON conforming to the RefactorPatches schema (no extra keys, no prose).",
-    "",
-    "Markers:",
-    "# region BLOCK id=... kind=... phase=... plan_ref=\"...\" hash=... modifiable=...",
-    "...body...",
-    "# endregion BLOCK id=...",
-    "",
-    "Rules:",
-    "- Only modify blocks the user asks for OR blocks with modifiable=yes.",
-    "- Preserve public function signatures unless explicitly requested to change.",
-    "- Keep changes minimal; do not touch unrelated blocks.",
-    "- Each patch.new_code is the FULL body (between region markers), no markers and no markdown fences.",
-    "- Use old_hash when possible; if mismatched, still propose the best-effort patch and include notes.",
-    "- Do NOT create new blocks unless explicitly requested; if necessary, add a note requesting a re-index pass.",
-    "- Never emit code outside the patches array.",
-    "",
-    "Validation before emitting:",
-    "- Ensure each block_id exists in CURRENT_CODE.",
-    "- Ensure new_code is syntactically valid Python (best effort).",
-    "",
-    "Output example:",
-    "{ \"patches\": [ { \"block_id\": \"ui.controls\", \"new_code\": \"def render_controls(...):\n    ...\n\", \"old_hash\": \"17ac0b55\", \"notes\": \"raise radius max\" } ],",
-    "  \"user_markdown\": \"Kurz: Radius-Maximum auf 50km erhöht.\" }",
-])
-
-# ===== Hilfsfunktionen ========================================================
+# ===== Util ===================================================================
 def _sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
 
 def _safe_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False)
 
-def extract_first_python_block(text: str) -> Optional[str]:
-    m = re.search(r"```(?:py|python|python3)?\s*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
-    return m.group(1).strip() if m else None
-
-CODE_FENCE_RE = re.compile(r"```[a-zA-Z0-9_\-]*\s*.*?```", re.DOTALL)
-
-def strip_fenced_code_blocks(text: str) -> str:
-    """Entfernt alle Markdown-Code-Fences (```...```) – nur für die UI-Anzeige."""
-    if not isinstance(text, str) or "```" not in text:
-        return text
-    return CODE_FENCE_RE.sub("", text).strip()
-
 def ensure_event_loop() -> None:
-    """Event-Loop für Streamlit-Thread sicherstellen (nur: erstellen, nicht laufen lassen)."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
-# ==== Neu: PLAN_SPEC aus un-fenced JSON am Textanfang herausfiltern ===========
-def _strip_leading_plan_spec(text: str) -> Tuple[str, Optional[dict]]:
-    """
-    Entfernt ein am Textanfang stehendes JSON-Objekt, wenn es wie eine PLAN_SPEC aussieht.
-    Gibt (bereinigter_text, planspec_dict|None) zurück.
-    """
-    if not isinstance(text, str) or not text.strip():
-        return text, None
-    m = re.match(r'^\s*(\{.*?\})\s*(?:\n|$)', text, flags=re.DOTALL)
-    if not m:
-        return text, None
-    blob = m.group(1)
-    try:
-        obj = json.loads(blob)
-        return text[m.end():].lstrip(), obj
-    except Exception:
-        return text, None
 
 # ===== Earth Engine (Host-Init) ===============================================
 EE_OK = True
@@ -238,13 +80,11 @@ except Exception:
 def ee_maybe_init() -> bool:
     if not EE_OK:
         return False
-    # Bereits initialisiert?
     try:
         ee.Number(1).getInfo()
         return True
     except Exception:
         pass
-    # Init via Streamlit-Secrets (Service Account)
     try:
         sa = st.secrets.get("EE_SERVICE_ACCOUNT")
         key = st.secrets.get("EE_PRIVATE_KEY")
@@ -283,27 +123,21 @@ def ee_maybe_init() -> bool:
 
 _EE_READY = ee_maybe_init()
 
-# ===== Function Tools (ohne ui_suggest) ======================================
+# ===== Tools ==================================================================
 @function_tool
 def tool_get_meta() -> str:
-    """Lädt layer1_index.yml und liefert den Text (UTF-8)."""
     if not META_INDEX_PATH.exists():
         return _safe_json({"error": f"meta index not found: {META_INDEX_PATH}"})
     return META_INDEX_PATH.read_text(encoding="utf-8")
 
 @function_tool
 def tool_get_policy() -> str:
-    """Lädt policy.json und liefert den Text (UTF-8)."""
     if not POLICY_PATH.exists():
         return _safe_json({"error": f"policy not found: {POLICY_PATH}"})
     return POLICY_PATH.read_text(encoding="utf-8")
 
 @function_tool
 def tool_get_uc_sections(uc_id: str, sections: List[str]) -> str:
-    """
-    Lädt gezielte Sektionen eines UC-Packs (YAML → JSON-Auswahl).
-    sections: z. B. ["param_spec","invariants","visualize_presets","allowed_patterns","ui_contracts","render_pattern","capabilities_required","capabilities_provided","checks"]
-    """
     try:
         import yaml
     except Exception:
@@ -324,21 +158,12 @@ def tool_get_uc_sections(uc_id: str, sections: List[str]) -> str:
             out[sec] = data[sec]
     return _safe_json(out)
 
-# ---- Bundle-Tool zurück (wird vom Agent/Fixer gebraucht) ---------------------
 @function_tool
 def tool_bundle_components(components: List[str]) -> str:
-    """
-    Lädt mehrere Komponenten und liefert:
-    {
-      "bundle": "<concatenated files mit BEGIN/END headers>",
-      "manifest": [{"id": path, "sha1": "...", "bytes": N}, ...]
-    }
-    """
     bundle_parts: List[str] = []
     manifest: List[Dict[str, Any]] = []
 
     LEGACY_DIR = BASE_DIR / "blocks" / "components" / "legacy"
-
     ALLOW_PREFIXES = [
         "blocks/components/gee/",
         "blocks/components/visual/",
@@ -367,24 +192,15 @@ def tool_bundle_components(components: List[str]) -> str:
 
     return _safe_json({"bundle": "\n".join(bundle_parts), "manifest": manifest})
 
-# --- Runner-Tool: interne Impl + Tool-Wrapper, mit EE/Path-Prelude ------------
 def _tool_run_python_impl(code: str,
                           filename: Optional[str] = None,
                           timeout_sec: int = 600,
                           mode: str = "script",
                           port: int = 8502,
                           preflight_only: bool = False) -> str:
-    """
-    Führt Code im runner/sandbox aus.
-    - mode="script":  python file.py (stdout/stderr)
-    - mode="streamlit": streamlit run file.py --server.headless --server.port {port}
-                        (gibt url + pid + bootstrap log zurück)
-    Hinweis: Auf Streamlit Cloud ist die zweite Streamlit-Instanz meist nicht erreichbar.
-    """
     if not filename:
         filename = "app_run.py"
 
-    # Prelude injizieren: EE-Init im Subprozess (Service Account via ENV)
     ee_prelude = (
         "try:\n"
         "    import os, ee, json, tempfile\n"
@@ -424,18 +240,15 @@ def _tool_run_python_impl(code: str,
     )
 
     def _merge_with_future_first(user_code: str) -> str:
-        """Ensure 'from __future__ import annotations' stays on the very first line."""
         try:
             lines = (user_code or '').splitlines()
             if lines and lines[0].strip() == "from __future__ import annotations":
-                # keep future import on line 1, then prelude, then rest
                 head = lines[0] + "\n" + ee_prelude + "\n" + "\n".join(lines[1:])
                 return head
             return ee_prelude + (user_code or "")
         except Exception:
             return ee_prelude + (user_code or "")
 
-    # Write file: for preflight-only path, do NOT inject the prelude to avoid 'future' placement issues.
     code_to_write = (code or "")
     if not preflight_only:
         code_to_write = _merge_with_future_first(code_to_write)
@@ -443,7 +256,6 @@ def _tool_run_python_impl(code: str,
     target = SANDBOX_DIR / filename
     target.write_text(code_to_write, encoding="utf-8")
 
-    # Subprozess-Umgebung: Repo in PYTHONPATH + EE-Secrets weitergeben
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{str(BASE_DIR)}" + (":" + env["PYTHONPATH"] if "PYTHONPATH" in env and env["PYTHONPATH"] else "")
     try:
@@ -457,7 +269,6 @@ def _tool_run_python_impl(code: str,
     except Exception:
         pass
 
-    # --- Neuer Preflight-Zweig: nur Syntax prüfen, keine Ausführung ---
     if preflight_only:
         try:
             proc = subprocess.run(
@@ -494,31 +305,22 @@ def _tool_run_python_impl(code: str,
                 timeout=timeout_sec,
                 env=env,
             )
-            return json.dumps({
-                "ok": proc.returncode == 0,
-                "stdout": proc.stdout[-15000:],
-                "stderr": proc.stderr[-15000:],
-                "path": str(target),
-                "mode": "script"
-            }, ensure_ascii=False)
         except subprocess.TimeoutExpired as e:
             return json.dumps({
-                "ok": False,
-                "stdout": (getattr(e, "stdout", "") or "")[-15000:],
-                "stderr": f"TIMEOUT after {timeout_sec}s",
-                "path": str(target),
-                "mode": "script"
+                "ok": False, "stdout": (getattr(e, "stdout", "") or "")[-15000:], "stderr": f"TIMEOUT after {timeout_sec}s",
+                "path": str(target), "mode": "script"
             }, ensure_ascii=False)
+        return json.dumps({
+            "ok": proc.returncode == 0,
+            "stdout": proc.stdout[-15000:], "stderr": proc.stderr[-15000:],
+            "path": str(target), "mode": "script"
+        }, ensure_ascii=False)
 
     if mode == "streamlit":
         try:
             proc = subprocess.Popen(
                 ["streamlit", "run", str(target), "--server.headless", "true", "--server.port", str(port)],
-                cwd=SANDBOX_DIR,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
+                cwd=SANDBOX_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
             )
             try:
                 bootstrap = proc.stdout.readline().strip() if proc.stdout else ""
@@ -526,172 +328,69 @@ def _tool_run_python_impl(code: str,
                 bootstrap = ""
             url = f"http://localhost:{port}"
             return json.dumps({
-                "ok": True,
-                "url": url,
-                "pid": proc.pid,
-                "path": str(target),
+                "ok": True, "url": url, "pid": proc.pid, "path": str(target),
                 "hint": "Zweite Streamlit-Instanz ist auf Cloud-Hosts i. d. R. nicht erreichbar.",
-                "mode": "streamlit",
-                "bootstrap_log": bootstrap[-2000:]
+                "mode": "streamlit", "bootstrap_log": bootstrap[-2000:]
             }, ensure_ascii=False)
         except Exception as e:
             return json.dumps({
-                "ok": False,
-                "error": f"Failed to start streamlit: {e}",
-                "path": str(target),
-                "mode": "streamlit"
+                "ok": False, "error": f"Failed to start streamlit: {e}", "path": str(target), "mode": "streamlit"
             }, ensure_ascii=False)
 
     return json.dumps({"error": f"unknown mode '{mode}'"})
 
-# Für den Agenten als Tool registrieren:
 tool_run_python = function_tool(_tool_run_python_impl)
 
-# ===== PLAN_SPEC-Handling (robust) ============================================
-PLAN_SPEC_KEY_CANDIDATES = ("use_case", "aoi_spec", "render", "components")
-
-def _looks_like_plan_spec(obj: Any) -> bool:
-    return isinstance(obj, dict) and all(k in obj for k in PLAN_SPEC_KEY_CANDIDATES)
-
-def _extract_plan_spec_from_text(answer_text: str) -> Tuple[Optional[dict], str]:
-    """
-    Sucht nach PLAN_SPEC in der sichtbaren Antwort und entfernt sie.
-    Unterstützt:
-      - Marker: PLAN_SPEC_BEGIN ... PLAN_SPEC_END mit ```json ... ```
-      - Fenced code block ```json ... ```
-    """
-    text = answer_text or ""
-    marker_regex = re.compile(
-        r"PLAN_SPEC_BEGIN\s*```json\s*(\{.*?\})\s*```\s*PLAN_SPEC_END",
-        re.DOTALL | re.IGNORECASE
-    )
-    m = marker_regex.search(text)
-    if m:
-        try:
-            spec = json.loads(m.group(1))
-            cleaned = marker_regex.sub("", text).strip()
-            if _looks_like_plan_spec(spec):
-                return spec, cleaned
-        except Exception:
-            pass
-
-    fence_json_regex = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
-    for jm in fence_json_regex.finditer(text):
-        try:
-            candidate = json.loads(jm.group(1))
-            if _looks_like_plan_spec(candidate):
-                cleaned = (text[:jm.start()] + text[jm.end():]).strip()
-                return candidate, cleaned
-        except Exception:
-            continue
-
-    return None, text
-
-# ===== Agent Setup + persistente SDK-Session ==================================
-if AGENTS_OK:
-    # --- ONLY plan_spec as structured output (Pydantic v2 safe) ---------------
-    from pydantic import BaseModel, Field
-
-    class PlanSpecOnly(BaseModel):
-        plan_spec: Optional[Dict[str, Any]] = Field(default=None)
-
-    # Fix for "class-not-fully-defined" on some environments
-    try:
-        PlanSpecOnly.model_rebuild()
-    except Exception:
-        pass
-
-class UiPlanCode(BaseModel):
-    """Structured output for builder: visible text + plan + code + block index."""
-    user_markdown: str = Field(description="Visible user-facing markdown (no code fences).")
-    plan_spec: Optional[Dict[str, Any]] = Field(default=None, description="Internal planning spec object.")
-    code: Optional[str] = Field(default=None, description="Final Python code (no fences, directly executable).")
-    block_index: Optional[List[Dict[str, Any]]] = Field(default=None, description="List of code-block metadata for refactor agent.")
-    components_manifest: Optional[List[Dict[str, Any]]] = Field(default=None, description="Components manifest for future refactors.")
+# ===== Structured Output – Haupt-Agent (4 Felder) =============================
+class UiResponse(BaseModel):
+    user_markdown: str = Field(description="Sichtbarer Text für den Chat. Kein Code-Fence.")
+    suggestions: Optional[List[str]] = Field(default=None, description="Bis zu 4 Vorschläge (Buttons).")
+    json: Optional[Dict[str, Any]] = Field(default=None, description="Interner JSON-Block (z. B. plan_spec, block_index). Niemals anzeigen.")
+    code: Optional[str] = Field(default=None, description="Vollständiger Python-Code (ohne Markdown-Fence).")
 
 try:
-    UiPlanCode.model_rebuild()
+    UiResponse.model_rebuild()
 except Exception:
     pass
 
+# ===== Refactor-Output – Agent 2 (Patches only) ===============================
 class PatchItem(BaseModel):
     block_id: str
     new_code: str
     old_hash: Optional[str] = None
     notes: Optional[str] = None
 
-class RefactorPatches(BaseModel):
-    patches: List[PatchItem]
+class RefactorResponse(BaseModel):
     user_markdown: Optional[str] = None
+    suggestions: Optional[List[str]] = None
+    patches: List[PatchItem]
 
 try:
-    RefactorPatches.model_rebuild()
+    RefactorResponse.model_rebuild()
 except Exception:
     pass
 
-@function_tool
-def request_structured_output(
-    reason: Optional[str] = None,
-    need_plan: bool = True,
-    need_code: bool = True,
-) -> bool:
-    """Signalisiert, dass ein strukturierter Build (Plan/Code) gewünscht ist."""
-    st.session_state._want_structured = True
-    st.session_state._want_plan = bool(need_plan)
-    st.session_state._want_code = bool(need_code)
-    st.session_state._structured_reason = reason or ""
-    return True
-
-@function_tool
-def request_refactor(reason: Optional[str] = None) -> bool:
-    """Signalisiert, dass Patches für den bestehenden, markierten Code erzeugt werden sollen."""
-    st.session_state._want_refactor = True
-    st.session_state._refactor_reason = reason or ""
-    return True
-
-# === Agent 0 — sichtbarer Gesprächs-Agent (Markdown only) =====================
-agent0 = Agent(
-    name="EO-Agent0",
-    instructions=MEGA_PROMPT + "\n\n" + AGENT0_ADDENDUM,
-    tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python, request_structured_output, request_refactor],
-    model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
-)
-
-# === Builder-Agent für strukturierte Ausgabe (kein Streaming erforderlich) ===
-builder_agent = Agent(
-    name="EO-Builder",
-    instructions=MEGA_PROMPT + "\n\n" + BUILDER_MARKER_RULES + "\n\n" + BUILDER_ADDENDUM,
-    tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python, request_structured_output],
-    model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
-    output_type=AgentOutputSchema(UiPlanCode, strict_json_schema=False),
-)
-
-# === Refactor-Agent (liefert nur Patches im JSON-Schema) ======================
-refactor_agent = Agent(
-    name="EO-Refactor",
-    instructions=MEGA_PROMPT + "\n\n" + REFACTOR_RULES + "\n\n" + REFACTOR_ADDENDUM,
-    tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python, request_structured_output, request_refactor],
-    model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
-    output_type=AgentOutputSchema(RefactorPatches, strict_json_schema=True),
-)
-
-if not AGENTS_OK:
-    agent0 = None
+# ===== Agenten-Instanzen ======================================================
+APP_AGENT: Optional[Agent] = None
+REFACTOR_AGENT: Optional[Agent] = None
 
 if AGENTS_OK:
-    try:
-        if "agent_session_id" not in st.session_state:
-            st.session_state.agent_session_id = uuid.uuid4().hex
-        SESSIONS_DB = str((RUNNER_DIR / "sessions.db").resolve())
-        sdk_session = SQLiteSession(st.session_state.agent_session_id, SESSIONS_DB)
-    except Exception:
-        sdk_session = SQLiteSession(st.session_state.agent_session_id)  # in-memory fallback
-else:
-    sdk_session = None  # type: ignore
+    APP_AGENT = Agent(
+        name="EO-AppAgent",
+        instructions=MEGA_PROMPT,  # später leicht anpassen für 4-Felder-Protokoll
+        tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python],
+        model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
+        output_type=AgentOutputSchema(UiResponse, strict_json_schema=False),
+    )
+    REFACTOR_AGENT = Agent(
+        name="EO-Refactor",
+        instructions=MEGA_PROMPT + "\n\n" + "ROLE: Refactor Agent. Return only JSON patches per schema. No full files. User sees no code.",
+        tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components],
+        model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
+        output_type=AgentOutputSchema(RefactorResponse, strict_json_schema=True),
+    )
 
-# ============================================================================
-# >>>>>>>> SELF-HEALING: Sandbox + Fixer-Agent (Agent 2: Repair-Modus) <<<<<<
-# ============================================================================
+# ===== Self-Heal / Fixer (separat, nur intern) ================================
 import sys as _sh_sys
 import io as _sh_io
 
@@ -718,9 +417,7 @@ REQUIRED CODE SHAPE:
 """
 
 class PythonBlockOutput(BaseModel):
-    """Ausgabehülle für Fixer: nur Code."""
     code: str
-    """Ausgabehülle für Fixer: nur Code."""
 
 def _sh_get_fixer_agent():
     if not AGENTS_OK:
@@ -743,40 +440,10 @@ def _sh_get_fixer_agent():
     return fixer_agent
 
 def _sh_fix_code_once(code_text: str, error_log: str) -> Optional[str]:
-    """Lässt den Fixer laufen und gibt IMMER entweder reinen Code (str) oder None zurück."""
-    def _norm_code(obj: Any) -> Optional[str]:
-        # 1) Direkter String
-        if isinstance(obj, str):
-            s = obj.strip()
-            return s if s else None
-        # 2) Pydantic-Objekt mit .code
-        if hasattr(obj, "code") and isinstance(getattr(obj, "code"), str):
-            s = getattr(obj, "code").strip()
-            return s if s else None
-        # 3) Pydantic-Objekt → dict
-        if hasattr(obj, "model_dump"):
-            try:
-                d = obj.model_dump()
-                return _norm_code(d)
-            except Exception:
-                pass
-        # 4) dict mit "code"
-        if isinstance(obj, dict):
-            v = obj.get("code")
-            return _norm_code(v)
-        # 5) Sequenzen (z. B. Tuple aus (output, usage) etc.)
-        if isinstance(obj, (list, tuple)):
-            for item in obj:
-                s = _norm_code(item)
-                if s:
-                    return s
-        return None
-
     ensure_event_loop()
     fixer_agent = _sh_get_fixer_agent()
     if fixer_agent is None:
         return None
-
     user_payload = (
         "Repariere den folgenden Python-Code auf Basis dieses Fehlerlogs.\n"
         "Gib NUR den vollständigen, korrigierten Code zurück.\n\n"
@@ -790,17 +457,15 @@ def _sh_fix_code_once(code_text: str, error_log: str) -> Optional[str]:
         res = Runner.run_sync(
             fixer_agent,
             input=user_payload,
-            session=sdk_session,  # persistente Session auch für Fixer
+            session=sdk_session,
             max_turns=DEFAULT_MAX_TURNS,
         )
-        # final_output kann je nach SDK-Path str, Pydantic, dict oder Tuple sein
         out = getattr(res, "final_output", None)
-        s = _norm_code(out)
-        if s:
-            return s
-        # Fallback: evtl. liefert run_sync selbst ein Tuple zurück
-        s = _norm_code(res)
-        return s
+        if hasattr(out, "code") and isinstance(out.code, str) and out.code.strip():
+            return out.code
+        if isinstance(out, str) and out.strip():
+            return out
+        return None
     except Exception:
         return None
 
@@ -816,7 +481,6 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
         compiled = compile(code_text, "<healed>", "exec")
         exec(compiled, ns, ns)
 
-        # <<< Änderung A: echten Run erzwingen – Entry-Point suchen & ausführen >>>
         entry = None
         for fn_name in ("t2e_app", "render", "main"):
             fn = ns.get(fn_name)
@@ -827,13 +491,12 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
             raise RuntimeError("No callable entrypoint found (expected one of: t2e_app, render, main).")
 
         try:
-            entry()  # bevorzugt ohne Argumente
+            entry()
         except TypeError:
-            # Fallback: ggf. mit st durchreichen
             entry(st)
 
         ok = True
-    except BaseException as e:  # Stop/Rerun werden gefangen, Fixer kann triggern
+    except BaseException as e:
         out = buf.getvalue() + f"\nERROR({e.__class__.__name__}): {e!r}"
         return False, out
     finally:
@@ -844,46 +507,42 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
 def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str, List[str]]:
     logs: List[str] = []
     current = code_text
-    for i in range(1, max_rounds + 1):
+    for _i in range(1, max_rounds + 1):
         ok, out = _sh_sandbox_exec(current)
         if ok:
             return True, current, logs
         logs.append(out)
         fixed = _sh_fix_code_once(current, out)
-
-        # Robust: Nur vergleichen, wenn wirklich ein String vorliegt
-        if not isinstance(fixed, str) or not fixed.strip() or fixed.strip() == current.strip():
+        if not fixed or fixed.strip() == current.strip():
             break
-
         current = fixed
-
-    # letzter Versuch
     ok, out = _sh_sandbox_exec(current)
     logs.append(out)
     return ok, current, logs
 
-# === Preflight: unsichtbar ausführen, dann Modus schalten =====================
 def preflight_and_switch(code_text: str) -> bool:
-    """
-    Unsichtbarer Self-Heal/Run (mit Fixer bei Bedarf). Bei Erfolg:
-    - last_code persistieren
-    - build_completed=True, refactor_mode=True
-    - sichtbaren Autorun erlauben
-    """
     ok, final_code, _heal = self_heal_until_runs(code_text, max_rounds=5)
     if not ok:
         return False
     st.session_state.last_code = final_code
-    # Source-of-Truth aktualisieren
-    if "builder_context" not in st.session_state:
-        st.session_state.builder_context = {"plan_spec": None, "block_index": None, "code": None, "components_manifest": None}
-    st.session_state.builder_context["code"] = final_code
+    st.session_state._runner_autorun_done = False
     st.session_state.build_completed = True
     st.session_state.refactor_mode = True
-    st.session_state._runner_autorun_done = False
     return True
 
-# ===== Streamlit UI ===========================================================
+# ===== Session / SDK-Session ==================================================
+if AGENTS_OK:
+    try:
+        if "agent_session_id" not in st.session_state:
+            st.session_state.agent_session_id = uuid.uuid4().hex
+        SESSIONS_DB = str((RUNNER_DIR / "sessions.db").resolve())
+        sdk_session = SQLiteSession(st.session_state.agent_session_id, SESSIONS_DB)
+    except Exception:
+        sdk_session = SQLiteSession(st.session_state.agent_session_id)  # in-memory fallback
+else:
+    sdk_session = None  # type: ignore
+
+# ===== UI =====================================================================
 st.set_page_config(page_title="talk2earth — EO Agent", layout="wide")
 st.title("talk2earth — EO Agent (Agents SDK + Streamlit)")
 
@@ -893,235 +552,198 @@ with st.sidebar:
     st.write("OPENAI_API_KEY gesetzt:", "✅" if os.environ.get("OPENAI_API_KEY") else "❌")
     st.write(f"Earth Engine: {'✅' if _EE_READY else '❌'}")
     st.divider()
-    st.caption("Hinweis: AOI/Zeitraum/Parameter werden im Dialog geklärt; der Agent bündelt Komponenten vor dem Code.")
+    st.caption("Antwortformat: Markdown + Suggestions + JSON (intern) + Code (unsichtbarer Preflight).")
 
-# Session-States für Chat/Runner
+# Session-States
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "last_code" not in st.session_state:
     st.session_state.last_code = ""
-if "last_assistant_text" not in st.session_state:
-    st.session_state.last_assistant_text = ""
 if "skip_agent_on_next_run" not in st.session_state:
     st.session_state.skip_agent_on_next_run = False
 if "queued_input" not in st.session_state:
     st.session_state.queued_input = None
 if "_runner_autorun_done" not in st.session_state:
     st.session_state._runner_autorun_done = False
+if "last_json" not in st.session_state:
+    st.session_state.last_json = None
+if "refactor_mode" not in st.session_state:
+    st.session_state.refactor_mode = False
+if "build_completed" not in st.session_state:
+    st.session_state.build_completed = False
 
-# Guardeter UI-ReRun: UI-Repaint ohne neuen Agent-Call
-ui_only_rerun = False
-if st.session_state.get("skip_agent_on_next_run"):
-    st.session_state["skip_agent_on_next_run"] = False
-    ui_only_rerun = True
-
-# Verlauf (UI) rendern
+# Verlauf anzeigen
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# Bullets → Buttons (zusätzlich) vor der Eingabe
-selected = render_suggestions_from_text(st.session_state.get("last_assistant_text", ""))
-if selected:
-    st.session_state["queued_input"] = selected  # exakter Bullet-Text
-    st.rerun()
+def render_suggestions(suggestions: Optional[List[str]]) -> Optional[str]:
+    if not suggestions:
+        return None
+    s = [s for s in suggestions if isinstance(s, str) and s.strip()][:4]
+    if not s:
+        return None
+    st.subheader("Vorschläge")
+    cols = st.columns(2)
+    for i, label in enumerate(s):
+        with cols[i % 2]:
+            with st.container(border=True):
+                st.markdown(label)
+                if st.button("Auswählen", key=f"sugg_{i}", use_container_width=True):
+                    return label
+    return None
 
-# Chat-Eingabe (Queue zuerst, dann regulär)
+# Eingabe
 queued = st.session_state.get("queued_input")
 if queued:
     st.session_state["queued_input"] = None
     prompt = queued
 else:
-    prompt = st.chat_input("Nachricht an den Agenten eingeben und mit Enter senden")
+    prompt = st.chat_input("Nachricht eingeben…")
 
-if prompt and not ui_only_rerun:
-    # 1) User Nachricht anzeigen/speichern
+if prompt and not st.session_state.get("skip_agent_on_next_run"):
+    # User Nachricht
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    handoff_done = False  # wird True, wenn Builder oder Refactor wirklich ausgeführt hat
+    if not AGENTS_OK:
+        st.error("Agents SDK nicht verfügbar.")
+        st.stop()
 
-    # 2) Agent 0: STREAMING (sichtbar, Markdown only) — nur vor Handoff/ohne Refactor-Modus
-    in_refactor = bool(st.session_state.get("refactor_mode"))
-    if not in_refactor:
-        if not AGENTS_OK or agent0 is None:
-            st.error("Agents SDK nicht verfügbar.")
+    ensure_event_loop()
+
+    # === Routing: vor/nach erstem Build ======================================
+    if not st.session_state.get("build_completed", False):
+        # ---- Haupt-Agent: 4 Felder ------------------------------------------
+        if APP_AGENT is None:
+            st.error("Haupt-Agent nicht initialisiert.")
             st.stop()
 
-        streamed_parts: List[str] = []
-
-        async def _agent0_stream_and_render() -> Any:
-            result_stream = Runner.run_streamed(
-                agent0,
-                input=prompt,
-                session=sdk_session,
-                max_turns=60,
-            )
-            with st.chat_message("assistant"):
-                holder = st.empty()
-                async for ev in result_stream.stream_events():
-                    try:
-                        data = getattr(ev, "data", None)
-                        ev_type = getattr(ev, "type", "") or ""
-                        data_type = getattr(data, "type", "") if data is not None else ""
-                        if ev_type == "raw_response_event" and data_type == "response.output_text.delta":
-                            delta = getattr(data, "delta", "") or ""
-                            if delta:
-                                streamed_parts.append(delta)
-                                holder.markdown("".join(streamed_parts))
-                    except Exception:
-                        pass
-            return result_stream
-
-        # Führe das Streaming synchron aus
-        result = asyncio.run(_agent0_stream_and_render())
-        visible_text = "".join(streamed_parts)
-        st.session_state.messages.append({"role": "assistant", "content": visible_text})
-        st.session_state["last_assistant_text"] = visible_text
-
-    # 3) LLM-first Routing: Handoff → Builder; danach → Refactor
-    if (not st.session_state.get("build_completed", False)) and bool(st.session_state.get("_want_structured")):
-        # Builder nur nach explizitem Handoff durch Agent 0
-        ensure_event_loop()
-        builder_result = Runner.run_sync(
-            builder_agent,
+        res = Runner.run_sync(
+            APP_AGENT,
             input=prompt,
-            session=sdk_session,
-            max_turns=40,
-        )
-        # Handoff-Flag sofort zurücksetzen
-        st.session_state._want_structured = False
-
-        builder_out = getattr(builder_result, "final_output", None)
-        plan_spec_obj = None
-        code_out: Optional[str] = None
-        ui_text2 = None
-        block_index = None
-        components_manifest = None
-
-        if builder_out is not None and not isinstance(builder_out, str):
-            plan_spec_obj = getattr(builder_out, "plan_spec", None)
-            code_out = getattr(builder_out, "code", None)
-            block_index = getattr(builder_out, "block_index", None)
-            components_manifest = getattr(builder_out, "components_manifest", None)
-            ui_text2 = getattr(builder_out, "user_markdown", None)
-
-            # SoT persistieren (JSON nie anzeigen)
-            st.session_state["last_plan_spec"] = plan_spec_obj
-            st.session_state.builder_context = {
-                "plan_spec": plan_spec_obj,
-                "block_index": block_index,
-                "code": code_out,
-                "components_manifest": components_manifest,
-            }
-
-            # Sichtbar: nur user_markdown (Builder darf nach Handoff sprechen)
-            if isinstance(ui_text2, str) and ui_text2.strip():
-                with st.chat_message("assistant"):
-                    st.markdown(ui_text2)
-                st.session_state.messages.append({"role": "assistant", "content": ui_text2})
-                st.session_state["last_assistant_text"] = ui_text2
-
-            # Preflight (unsichtbar) → Fixer-Loop bei Bedarf; danach sichtbarer Autorun + Moduswechsel
-            if isinstance(code_out, str) and code_out.strip():
-                ok = preflight_and_switch(code_out)
-                if ok:
-                    handoff_done = True
-                else:
-                    with st.chat_message("assistant"):
-                        st.markdown("Ich behebe Laufzeitfehler im Hintergrund und starte die App, sobald sie stabil läuft.")
-        else:
-            with st.chat_message("assistant"):
-                st.markdown("Ich konnte den strukturierten Build nicht erstellen. Bitte bestätige kurz Ziel, Gebiet und Zeitraum.")
-    elif st.session_state.get("build_completed", False):
-        # Refactor-Modus: NUR Agent 2 (Agent 0 spricht hier nicht mehr)
-        ctx = st.session_state.builder_context
-        ref_in = {
-            "user_change_request": prompt,
-            "source_of_truth_code": ctx["code"],
-            "block_index": ctx["block_index"],
-            "plan_spec": ctx["plan_spec"],
-            "components_manifest": ctx["components_manifest"],
-        }
-        ensure_event_loop()
-        ref_res = Runner.run_sync(
-            refactor_agent,
-            input=json.dumps(ref_in, ensure_ascii=False),
             session=sdk_session,
             max_turns=60,
         )
-        patches_payload = getattr(ref_res, "final_output", None)
-        if patches_payload and not isinstance(patches_payload, str):
-            # 1) Sichtbaren Text aus dem Pydantic-Model lesen
-            user_md = getattr(patches_payload, "user_markdown", None)
-            if isinstance(user_md, str) and user_md.strip():
-                with st.chat_message("assistant"):
-                    st.markdown(user_md)
-                st.session_state.messages.append({"role": "assistant", "content": user_md})
-                st.session_state["last_assistant_text"] = user_md
+        out = getattr(res, "final_output", None)
 
-            # 2) Patches robust extrahieren und in plain dicts konvertieren
-            raw_patches = getattr(patches_payload, "patches", []) or []
-            norm_patches: List[Dict[str, Any]] = []
-            for p in raw_patches:
-                if hasattr(p, "model_dump"):
-                    norm_patches.append(p.model_dump())
-                elif isinstance(p, dict):
-                    norm_patches.append(p)
-                else:
-                    try:
-                        norm_patches.append({
-                            "block_id": getattr(p, "block_id"),
-                            "new_code": getattr(p, "new_code"),
-                            "old_hash": getattr(p, "old_hash", None),
-                            "notes": getattr(p, "notes", None),
-                        })
-                    except Exception:
-                        pass
+        user_md = ""
+        suggestions: Optional[List[str]] = None
+        json_obj: Optional[Dict[str, Any]] = None
+        code_text: Optional[str] = None
 
-            # 2a) Sichere Basis für apply_patches: code immer als String bereitstellen
-            base_code = None
-            if isinstance(ctx, dict):
-                base_code = ctx.get("code")
-            if base_code is None or (isinstance(base_code, str) and not base_code.strip()):
-                base_code = st.session_state.get("last_code", "")
-            if not isinstance(base_code, str):
-                base_code = str(base_code or "")
+        if out and not isinstance(out, str):
+            user_md = getattr(out, "user_markdown", "") or ""
+            suggestions = getattr(out, "suggestions", None)
+            json_obj = getattr(out, "json", None)
+            code_text = getattr(out, "code", None)
 
-            # 3) Patches anwenden (oder unverändert lassen, wenn keine Patches)
-            if not norm_patches:
-                with st.chat_message("assistant"):
-                    st.markdown("Ich habe keine änderbaren Blöcke gefunden – der Code bleibt unverändert.")
-                patched_code = base_code
-            else:
-                patched_code = apply_patches(base_code, norm_patches, strategy="body_only")
+        # 1) user_markdown
+        if isinstance(user_md, str) and user_md.strip():
+            with st.chat_message("assistant"):
+                st.markdown(user_md)
+            st.session_state.messages.append({"role": "assistant", "content": user_md})
 
-            st.session_state.builder_context["code"] = patched_code
+        # 2) suggestions
+        selected = render_suggestions(suggestions)
+        if selected:
+            st.session_state["queued_input"] = selected
+            st.session_state["skip_agent_on_next_run"] = False
+            st.rerun()
 
-            # 4) Preflight + Autorun
-            ok = preflight_and_switch(patched_code)
+        # 3) JSON → nur persistieren (kann plan_spec, block_index, components_manifest enthalten)
+        if isinstance(json_obj, dict):
+            st.session_state["last_json"] = json_obj
+
+        # 4) code → Preflight/Fixer/Autorender + Moduswechsel
+        handoff_done = False
+        if isinstance(code_text, str) and code_text.strip():
+            ok = preflight_and_switch(code_text)
             if ok:
                 handoff_done = True
             else:
                 with st.chat_message("assistant"):
-                    st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
-        else:
+                    st.markdown("Ich behebe Laufzeitfehler intern und starte automatisch neu, sobald stabil.")
+
+        if handoff_done:
+            st.session_state["skip_agent_on_next_run"] = True
+            st.rerun()
+
+    else:
+        # ---- Refactor-Agent (Agent 2): Patches only --------------------------
+        if REFACTOR_AGENT is None:
+            st.error("Refactor-Agent nicht initialisiert.")
+            st.stop()
+
+        # Kontext für Agent 2 zusammenstellen
+        ctx_json = st.session_state.get("last_json") or {}
+        ctx_payload = {
+            "user_change_request": prompt,
+            "source_of_truth_code": st.session_state.last_code,
+            "block_index": ctx_json.get("block_index"),
+            "plan_spec": ctx_json.get("plan_spec") or ctx_json.get("planspec") or ctx_json.get("json"),
+            "components_manifest": ctx_json.get("components_manifest"),
+        }
+
+        ref_res = Runner.run_sync(
+            REFACTOR_AGENT,
+            input=json.dumps(ctx_payload, ensure_ascii=False),
+            session=sdk_session,
+            max_turns=60,
+        )
+        patches_out = getattr(ref_res, "final_output", None)
+
+        user_md = None
+        suggestions = None
+        patches: List[Dict[str, Any]] = []
+
+        if patches_out and not isinstance(patches_out, str):
+            user_md = getattr(patches_out, "user_markdown", None)
+            suggestions = getattr(patches_out, "suggestions", None)
+            patches = getattr(patches_out, "patches", []) or []
+
+        # Sichtbar: user_markdown
+        if isinstance(user_md, str) and user_md.strip():
             with st.chat_message("assistant"):
-                st.markdown("Ich konnte keine gültigen Patches erzeugen. Bitte beschreibe die gewünschte Änderung konkreter.")
+                st.markdown(user_md)
+            st.session_state.messages.append({"role": "assistant", "content": user_md})
 
-    if handoff_done:
-        st.session_state["skip_agent_on_next_run"] = True
-        st.rerun()
+        # Vorschläge
+        selected = render_suggestions(suggestions)
+        if selected:
+            st.session_state["queued_input"] = selected
+            st.session_state["skip_agent_on_next_run"] = False
+            st.rerun()
 
-# ===== Auto-Re-Render nach Re-Run (kein Prompt aktiv) =========================
-if (('skip_agent_on_next_run' in st.session_state and not st.session_state['skip_agent_on_next_run']) or True) and st.session_state.get("last_code"):
+        # Patches anwenden → Preflight → Autorender
+        handoff_done = False
+        if patches:
+            try:
+                patched = apply_patches(st.session_state.last_code, patches, strategy="body_only")
+                ok = preflight_and_switch(patched)
+                if ok:
+                    # Kontext bleibt in last_json; falls Agent 2 neue block_index o.ä. liefern sollte,
+                    # kann MEGA_PROMPT künftig das in user json signalisieren. Hier keine Anzeige.
+                    handoff_done = True
+                else:
+                    with st.chat_message("assistant"):
+                        st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
+            except Exception as e:
+                with st.chat_message("assistant"):
+                    st.markdown(f"Patch-Anwendung fehlgeschlagen: {e!r}. Bitte Wünsche etwas konkreter formulieren.")
+
+        if handoff_done:
+            st.session_state["skip_agent_on_next_run"] = True
+            st.rerun()
+
+# ===== Auto-Re-Render nach Re-Run =============================================
+if st.session_state.get("last_code"):
     try:
         ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
         compiled = compile(st.session_state.last_code, "<autorender>", "exec")
         exec(compiled, ns, ns)
 
-        # <<< Änderung C: Entry-Point im Autorender explizit aufrufen >>>
         entry = None
         for fn_name in ("t2e_app", "render", "main"):
             fn = ns.get(fn_name)
@@ -1140,5 +762,3 @@ if (('skip_agent_on_next_run' in st.session_state and not st.session_state['skip
             st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
-
-# Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
