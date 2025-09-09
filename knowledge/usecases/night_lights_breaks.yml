@@ -58,5 +58,5 @@ checks:
 few_shot_components:
   - "blocks/components/gee/aoi_from_spec.py"
   - "blocks/components/visual/split_map_right.py"
-  -
-  -
+  - "blocks/components/gee/nightlights_acquire_reduce.py"
+  - "blocks/components/gee/nightlights_break_detection.py"
