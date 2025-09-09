@@ -587,14 +587,16 @@ def _sh_fix_code_once(code_text: str, error_log: str) -> Optional[str]:
     except Exception:
         return None
 
+
 def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
     buf = _sh_io.StringIO()
-    _stdout = _sh_sys.stdout
-    _stderr = _sh_sys.stderr
-    ok = False
+    _stdout, _stderr = _sh_sys.stdout, _sh_sys.stderr
+    ok_out: bool = False
+    text_out: str = ""
     try:
         _sh_sys.stdout = buf
         _sh_sys.stderr = buf
+
         ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
         compiled = compile(code_text, "<healed>", "exec")
         exec(compiled, ns, ns)
@@ -613,14 +615,18 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
         except TypeError:
             entry(st)
 
-        ok = True
+        ok_out = True
+        text_out = buf.getvalue()
     except BaseException as e:
-        out = buf.getvalue() + f"\nERROR({e.__class__.__name__}): {e!r}"
-        return False, out
+        text_out = buf.getvalue() + f"\nERROR({e.__class__.__name__}): {e!r}"
+        ok_out = False
     finally:
         _sh_sys.stdout = _stdout
         _sh_sys.stderr = _stderr
-    return ok, buf.getvalue()
+    return ok_out, text_out
+
+
+
 
 def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str, List[str]]:
     logs: List[str] = []
@@ -837,13 +843,16 @@ if prompt and not ui_only_rerun:
 
         # 4) code → Preflight/Fixer/Autorender + Moduswechsel
         handoff_done = False
+        ok = False
         if isinstance(code_text, str) and code_text.strip():
             ok = preflight_and_switch(code_text)
+        
         if ok:
             handoff_done = True
         else:
             with st.chat_message("assistant"):
                 st.markdown("Ich behebe Laufzeitfehler intern und starte automatisch neu, sobald stabil.")
+
 
 
 
@@ -974,6 +983,7 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
         st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
+
 
 
 
