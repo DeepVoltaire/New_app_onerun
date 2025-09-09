@@ -653,6 +653,15 @@ if "refactor_mode" not in st.session_state:
 if "build_completed" not in st.session_state:
     st.session_state.build_completed = False
 
+# --- UI-only Rerun Handling (einmalige Entkopplung des Autorender-Reruns) ---
+ui_only_rerun = False
+if st.session_state.get("skip_agent_on_next_run"):
+    # Dies ist der Turn nach dem Autorender-Rerun: Agent NICHT anrufen,
+    # Flag zurücksetzen, UI/Autorender laufen lassen.
+    st.session_state["skip_agent_on_next_run"] = False
+    ui_only_rerun = True
+
+
 # Verlauf anzeigen
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
@@ -682,7 +691,7 @@ if queued:
 else:
     prompt = st.chat_input("Nachricht eingeben…")
 
-if prompt and not st.session_state.get("skip_agent_on_next_run"):
+if prompt and not ui_only_rerun:
     # User Nachricht
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -843,4 +852,5 @@ if st.session_state.get("last_code"):
             st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
+
 
