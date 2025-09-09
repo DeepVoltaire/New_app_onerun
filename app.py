@@ -155,7 +155,6 @@ BUILDER_MARKER_RULES = "\n".join([
     "- Provide a callable entrypoint def main(): all Streamlit/geemap rendering happens inside main(); do not render at import time.",
 ])
 
-
 # === Refactor rules (safe string) ===
 REFACTOR_RULES = "\n".join([
     "You are the Refactor Agent. The CURRENT_CODE is the single source of truth.",
@@ -184,7 +183,6 @@ REFACTOR_RULES = "\n".join([
     "  \"user_markdown\": \"Kurz: Radius-Maximum auf 50km erhöht.\" }",
 ])
 
-
 # ===== Hilfsfunktionen ========================================================
 def _sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
@@ -202,9 +200,7 @@ def strip_fenced_code_blocks(text: str) -> str:
     """Entfernt alle Markdown-Code-Fences (```...```) – nur für die UI-Anzeige."""
     if not isinstance(text, str) or "```" not in text:
         return text
-
     return CODE_FENCE_RE.sub("", text).strip()
-
 
 def ensure_event_loop() -> None:
     """Event-Loop für Streamlit-Thread sicherstellen (nur: erstellen, nicht laufen lassen)."""
@@ -349,7 +345,6 @@ def tool_bundle_components(components: List[str]) -> str:
         "blocks/components/ui/",
         "blocks/components/util/",
     ]
-
 
     for rel in components or []:
         p = (BASE_DIR / rel).resolve()
@@ -619,7 +614,6 @@ try:
 except Exception:
     pass
 
-
 class PatchItem(BaseModel):
     block_id: str
     new_code: str
@@ -635,7 +629,6 @@ try:
 except Exception:
     pass
 
-
 @function_tool
 def request_structured_output(
     reason: Optional[str] = None,
@@ -649,14 +642,12 @@ def request_structured_output(
     st.session_state._structured_reason = reason or ""
     return True
 
-
 @function_tool
 def request_refactor(reason: Optional[str] = None) -> bool:
     """Signalisiert, dass Patches für den bestehenden, markierten Code erzeugt werden sollen."""
     st.session_state._want_refactor = True
     st.session_state._refactor_reason = reason or ""
     return True
-
 
 # === Agent 0 — sichtbarer Gesprächs-Agent (Markdown only) =====================
 agent0 = Agent(
@@ -665,8 +656,6 @@ agent0 = Agent(
     tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python, request_structured_output, request_refactor],
     model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
 )
-
-
 
 # === Builder-Agent für strukturierte Ausgabe (kein Streaming erforderlich) ===
 builder_agent = Agent(
@@ -677,7 +666,6 @@ builder_agent = Agent(
     output_type=AgentOutputSchema(UiPlanCode, strict_json_schema=False),
 )
 
-
 # === Refactor-Agent (liefert nur Patches im JSON-Schema) ======================
 refactor_agent = Agent(
     name="EO-Refactor",
@@ -686,7 +674,6 @@ refactor_agent = Agent(
     model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
     output_type=AgentOutputSchema(RefactorPatches, strict_json_schema=True),
 )
-
 
 if not AGENTS_OK:
     agent0 = None
@@ -816,7 +803,6 @@ def _sh_fix_code_once(code_text: str, error_log: str) -> Optional[str]:
         return s
     except Exception:
         return None
-
 
 def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
     buf = _sh_io.StringIO()
@@ -1074,10 +1060,9 @@ if prompt and not ui_only_rerun:
                     st.markdown(user_md)
                 st.session_state.messages.append({"role": "assistant", "content": user_md})
                 st.session_state["last_assistant_text"] = user_md
-        
+
             # 2) Patches robust extrahieren und in plain dicts konvertieren
             raw_patches = getattr(patches_payload, "patches", []) or []
-            # raw_patches kann eine Liste aus PatchItem (Pydantic) sein → in dicts wandeln
             norm_patches: List[Dict[str, Any]] = []
             for p in raw_patches:
                 if hasattr(p, "model_dump"):
@@ -1085,7 +1070,6 @@ if prompt and not ui_only_rerun:
                 elif isinstance(p, dict):
                     norm_patches.append(p)
                 else:
-                    # Fallback: bestmöglich extrahieren
                     try:
                         norm_patches.append({
                             "block_id": getattr(p, "block_id"),
@@ -1094,13 +1078,27 @@ if prompt and not ui_only_rerun:
                             "notes": getattr(p, "notes", None),
                         })
                     except Exception:
-                        # ignoriere unlesbare Einträge still
                         pass
-        
-            # 3) Patches anwenden
-            patched_code = apply_patches(ctx["code"], norm_patches, strategy="body_only")
+
+            # 2a) Sichere Basis für apply_patches: code immer als String bereitstellen
+            base_code = None
+            if isinstance(ctx, dict):
+                base_code = ctx.get("code")
+            if base_code is None or (isinstance(base_code, str) and not base_code.strip()):
+                base_code = st.session_state.get("last_code", "")
+            if not isinstance(base_code, str):
+                base_code = str(base_code or "")
+
+            # 3) Patches anwenden (oder unverändert lassen, wenn keine Patches)
+            if not norm_patches:
+                with st.chat_message("assistant"):
+                    st.markdown("Ich habe keine änderbaren Blöcke gefunden – der Code bleibt unverändert.")
+                patched_code = base_code
+            else:
+                patched_code = apply_patches(base_code, norm_patches, strategy="body_only")
+
             st.session_state.builder_context["code"] = patched_code
-        
+
             # 4) Preflight + Autorun
             ok = preflight_and_switch(patched_code)
             if ok:
@@ -1111,7 +1109,6 @@ if prompt and not ui_only_rerun:
         else:
             with st.chat_message("assistant"):
                 st.markdown("Ich konnte keine gültigen Patches erzeugen. Bitte beschreibe die gewünschte Änderung konkreter.")
-
 
     if handoff_done:
         st.session_state["skip_agent_on_next_run"] = True
@@ -1145,6 +1142,3 @@ if (('skip_agent_on_next_run' in st.session_state and not st.session_state['skip
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
-
-
-
