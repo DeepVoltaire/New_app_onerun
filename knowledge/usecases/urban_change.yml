@@ -55,7 +55,6 @@ checks:
   - "Falls Jahr nicht verfügbar: Hinweis und Auswahl einschränken."
 
 few_shot_components:
-  - "blocks/components/util/scaffold.py"
   - "blocks/components/gee/aoi_from_spec.py"
   - "blocks/components/visual/split_map_right.py"
   - "blocks/components/ui/slider_int.py"
