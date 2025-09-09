@@ -121,6 +121,89 @@ def ee_maybe_init() -> bool:
 
 _EE_READY = ee_maybe_init()
 
+# ===== Minimal-Sanitizer (wie in der großen app.py) ===========================
+_COMPONENT_BEGIN_RE = re.compile(r"^\s*#\s*====\s*BEGIN\s+COMPONENT:", re.MULTILINE)
+_REGION_RE = re.compile(r"^\s*#\s*region\s+BLOCK\s+id\s*=", re.MULTILINE)
+_FROM_BLOCKS_IMPORT_RE = re.compile(
+    r"^\s*from\s+blocks\.components\.[^\n]+\s+import\s+[^\n]+$",
+    re.MULTILINE
+)
+
+_SANITIZE_SIMPLE_RULES: Tuple[Tuple[str, str], ...] = (
+    # falscher main-Guard (alle Quotes erlauben)
+    (r"\bif\s+name\s*==\s*[\"']main[\"']\s*:", 'if __name__ == "__main__":'),
+)
+
+def _normalize_region_markers(text: str) -> str:
+    text = re.sub(r"(?m)^(?P<pre>\s*)(region\s+BLOCK\s+id=)", r"\g<pre># \2", text)
+    text = re.sub(r"(?m)^(?P<pre>\s*)(endregion\s+BLOCK\s+id=)", r"\g<pre># \2", text)
+    return text
+
+def _strip_page_config_lines(text: str) -> str:
+    # Entfernt jede Zeile mit st.set_page_config(...). (Einzeiler genügt hier)
+    return re.sub(r"(?m)^\s*st\.set_page_config\([^\n]*\)\s*$", "# [sanitized] st.set_page_config(...) removed", text)
+
+def _ensure_future_annotations_first(text: str) -> str:
+    """
+    Entfernt ALLE Varianten von (from future import annotations | from __future__ import annotations)
+    und setzt genau eine korrekte Zeile GANZ nach oben.
+    """
+    # kompletten Future-Import in der Datei entfernen
+    text_wo = re.sub(
+        r"(?m)^\s*from\s+(?:__)?future\s+import\s+annotations\s*$",
+        "",
+        text,
+    ).lstrip("\n")
+    return "from __future__ import annotations\n\n" + text_wo
+
+def sanitize_code(code_text: Any) -> str:
+    """Sanitizer: Marker, main-Guard, Future-Import, doppeltes page_config; optional Import-Bereinigung."""
+    s = _extract_source(code_text)
+
+    # 1) Marker normalisieren
+    s = _normalize_region_markers(s)
+
+    # 2) Regeln anwenden (main-Guard etc.)
+    for pat, repl in _SANITIZE_SIMPLE_RULES:
+        try:
+            s = re.sub(pat, repl, s)
+        except re.error:
+            pass
+
+    # 3) Future-Import ganz nach oben
+    s = _ensure_future_annotations_first(s)
+
+    # 4) Doppeltes set_page_config entfernen (Host setzt es bereits)
+    s = _strip_page_config_lines(s)
+
+    # 5) Redundante Komponenten-Imports entfernen, falls Bundle-Blöcke vorhanden
+    if _COMPONENT_BEGIN_RE.search(s):
+        s = _FROM_BLOCKS_IMPORT_RE.sub("", s)
+
+    return s
+
+def _extract_source(maybe_code: Any) -> str:
+    if isinstance(maybe_code, str):
+        return maybe_code
+    if isinstance(maybe_code, (bytes, bytearray)):
+        try:
+            return maybe_code.decode("utf-8")
+        except Exception:
+            return maybe_code.decode("latin-1", errors="ignore")
+    if isinstance(maybe_code, (list, tuple)):
+        for item in maybe_code:
+            if isinstance(item, str) and item.strip():
+                return item
+        if maybe_code:
+            return str(maybe_code[0])
+    if isinstance(maybe_code, dict):
+        for key in ("code", "new_code", "source", "text", "content"):
+            val = maybe_code.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        return json.dumps(maybe_code, ensure_ascii=False)
+    return str(maybe_code)
+
 # ===== Tools ==================================================================
 @function_tool
 def tool_get_meta() -> str:
@@ -342,68 +425,13 @@ tool_run_python = function_tool(_tool_run_python_impl)
 # ---------- Addendum: Haupt-Agent (4-Felder-Protokoll) ----------
 APP_AGENT_ADDENDUM = """
 [OUTPUT PROTOKOLL — HAUPT-AGENT · STRICT]
-
-Du gibst deinen Output IMMER als strukturiertes Objekt mit bis zu vier Feldern zurück:
-
-1) user_markdown (string)
-   - Sichtbarer, natürlicher Text für die Person.
-   - Keine Code-Fences, kein JSON, keine Marker.
-   - Kurz und menschlich: Orientierung, Rückfragen oder Bestätigung.
-   - Wenn alles klar ist (Stop-Kriterien erfüllt), ein kurzer Satz: „Ich baue dir …“
-
-2) suggestions (array of string, max 4)
-   - Bis zu vier ergänzende, klickbare Vorschläge.
-   - Kurz, handlungsorientiert, konsistent mit user_markdown.
-   - Beispiele: „Nimm Juli 2023“, „Erweitere Umkreis auf 20 km“, „Zeige Vergleich links/rechts“.
-
-3) json (object)
-   - Nur intern, niemals anzeigen.
-   - Container für strukturierte Daten wie:
-     - plan_spec (gemäß Abschnitt 15.2)
-     - components_manifest (Liste der verwendeten Komponenten inkl. Hash/Bytes)
-     - policy_notes (interne Korrekturen/Begründungen)
-   - Strikt valides JSON. Keine Kommentare, keine Erklärsätze.
-
-4) code (string)
-   - Vollständiger, lauffähiger Python-Quelltext, ohne Markdown-Fences.
-   - Ein einziger Entry-Point (def main(): …), keine EE-Init/Auth im Code.
-   - UI optional, GEE-first, Render nur in main(), nichts beim Import.
-   - Nur ausgeben, wenn die Stop-Kriterien erfüllt sind (siehe Abschnitt 12).
-
-SICHTBARKEIT:
-- user_markdown und suggestions → sichtbar.
-- json und code → niemals direkt im Chat anzeigen.
-
-PLAN_SPEC:
-- Falls Richtung/Parameter klar (Stop-Kriterien erfüllt): lege PLAN_SPEC streng nach Abschnitt 15.2 in json.plan_spec ab.
-- Fehlen Pflichtangaben: stelle Rückfragen in user_markdown und gib KEIN json.plan_spec aus.
-- Niemals PLAN_SPEC als Text ausgeben.
+...
 """
 
 # ---------- Addendum: Refactor-Agent (One-Run Vollcode-Output) ----------
 REFACTOR_ADDENDUM = """
 [REFACTOR-MODUS · ONE-RUN VOLLCODE-OUTPUT]
-
-Kontextquellen (vom Host als JSON übergeben):
-- 'source_of_truth_code' (vollständiger, aktuell laufender Code).
-- 'plan_spec' (aktuelle Plan-Spezifikation, falls vorhanden).
-- 'components_manifest' (verwendete Komponenten/Hashes).
-- 'user_change_request' (Wunsch der Person).
-
-Dein Output verwendet GENAU dasselbe 4-Felder-Protokoll wie der Haupt-Agent:
-{
-  "user_markdown": "<sichtbar>",
-  "suggestions": ["<max 4>"],
-  "json": { "plan_spec": {...}, "components_manifest": [...] },
-  "code": "<VOLLSTÄNDIGER PYTHON CODE, OHNE FENCES>"
-}
-
-Regeln:
-- Kein Patch-Format. Gib IMMER Vollcode im Feld 'code', wenn Änderungen gewünscht/erforderlich sind.
-- Minimal-invasiv auf Logik-Ebene, aber Ergebnis ist eine konsistente, ausführbare Gesamtdatei.
-- Keine EE-Init/Auth im Code. Einziger Entry-Point def main(): ...
-- Nichts beim Import ausführen; Render ausschließlich in main().
-- Wenn noch Klärung nötig: nur 'user_markdown' + 'suggestions' ausgeben (ohne 'code').
+...
 """
 
 # ---------- Output-Schemas ----------
@@ -418,52 +446,11 @@ try:
 except Exception:
     pass
 
-# ====== Sanitizer (identische Fixes wie in der komplexen app.py) ==============
-# falscher main-Guard (alle Quotes zulassen)
-_SANITIZE_SIMPLE_RULES: Tuple[Tuple[str, str], ...] = (
-    (r"\bif\s+name\s*==\s*[\"']main[\"']\s*:", 'if __name__ == "__main__":'),
-)
-
-# Entferne jegliche st.set_page_config(...) Zeilen aus Agenten-Code
-_SET_PAGE_CONFIG_RE = re.compile(r"(?m)^\s*st\.set_page_config\s*\(.*?\)\s*$")
-
-def _ensure_future_annotations_first(text: str) -> str:
-    """
-    Entfernt alle Varianten von 'from future import annotations' / 'from __future__ import annotations'
-    aus dem Text und setzt genau eine korrekte Zeile GANZ nach oben.
-    """
-    text_wo = re.sub(
-        r"(?m)^\s*from\s+(__)?future\s+import\s+annotations\s*$",
-        "",
-        text,
-    ).lstrip("\n")
-    return "from __future__ import annotations\n\n" + text_wo
-
-def sanitize_code(code_text: Any) -> str:
-    """Minimale, aber robuste Sanitisierung für Agent/Vollcode-Ausgaben."""
-    s = code_text if isinstance(code_text, str) else str(code_text)
-
-    # 1) main-Guard normalisieren
-    for pat, repl in _SANITIZE_SIMPLE_RULES:
-        try:
-            s = re.sub(pat, repl, s)
-        except re.error:
-            pass
-
-    # 2) Future-Import an Dateibeginn sicherstellen
-    s = _ensure_future_annotations_first(s)
-
-    # 3) Doppeltes Page-Config verhindern
-    s = _SET_PAGE_CONFIG_RE.sub("", s)
-
-    return s
-
 # ---------- Agent-Instanzen ----------
 APP_AGENT = None
 REFACTOR_AGENT = None
 
 if AGENTS_OK:
-    # Haupt-Agent
     APP_AGENT = Agent(
         name="EO-AppAgent",
         instructions=MEGA_PROMPT + "\n\n" + APP_AGENT_ADDENDUM,
@@ -475,7 +462,6 @@ if AGENTS_OK:
         output_type=AgentOutputSchema(UiResponse, strict_json_schema=False),
     )
 
-    # Refactor-Agent (One-Run Vollcode-Output, gleiches Schema)
     REFACTOR_AGENT = Agent(
         name="EO-Refactor",
         instructions=MEGA_PROMPT + "\n\n" + REFACTOR_ADDENDUM,
@@ -490,12 +476,10 @@ if AGENTS_OK:
 # ===== Preflight/Handoff (mit Sanitizer) ======================================
 def preflight_and_switch(code_text: str) -> bool:
     """
-    Nimmt den Agenten-Vollcode entgegen, sanitizt ihn (Future-Import, st.set_page_config entfernen,
-    Main-Guard fixen) und rendert dann.
+    Sanitize → optionaler Preflight → Handoff in Autorender.
     """
-    mode = st.session_state.get("self_heal_mode", "Direkt ausführen")
-
     sanitized = sanitize_code(code_text)
+    mode = st.session_state.get("self_heal_mode", "Direkt ausführen")
 
     if mode == "Nur Preflight":
         try:
@@ -509,7 +493,6 @@ def preflight_and_switch(code_text: str) -> bool:
                 st.markdown(f"Preflight fehlgeschlagen: {e}")
             return False
 
-    # Direktes Handover & Render
     try:
         st.session_state.last_code = sanitized
         st.session_state._runner_autorun_done = False
@@ -522,86 +505,7 @@ def preflight_and_switch(code_text: str) -> bool:
             st.markdown(f"Ausführen fehlgeschlagen: {e!r}")
         return False
 
-# ===== Session / SDK-Session ==================================================
-if AGENTS_OK:
-    try:
-        if "agent_session_id" not in st.session_state:
-            st.session_state.agent_session_id = uuid.uuid4().hex
-        if "sdk_session" not in st.session_state:
-            SESSIONS_DB = str((RUNNER_DIR / "sessions.db").resolve())
-            st.session_state.sdk_session = SQLiteSession(st.session_state.agent_session_id, SESSIONS_DB)
-    except Exception:
-        if "sdk_session" not in st.session_state:
-            st.session_state.sdk_session = SQLiteSession(st.session_state.agent_session_id)  # in-memory fallback
-    sdk_session = st.session_state.sdk_session
-else:
-    sdk_session = None  # type: ignore
-
 # ===== UI =====================================================================
-def autorender_now() -> None:
-    """Führt den aktuellen last_code *im render_slot* aus (ersetzt alte Anzeige)."""
-    slot = st.session_state.render_slot
-    slot.empty()  # alte Mini-App entfernen
-    with slot.container():
-        try:
-            import ee  # falls oben im Scope
-        except Exception:
-            ee = None  # noqa: F401
-        ns: Dict[str, object] = {"__name__": "__generated__", "st": st}
-        if ee is not None:
-            ns["ee"] = ee
-
-        try:
-            compiled = compile(st.session_state.last_code, "<autorender-now>", "exec")
-            exec(compiled, ns, ns)
-
-            entry = None
-            for fn_name in ("t2e_app", "render", "main"):
-                fn = ns.get(fn_name)
-                if callable(fn):
-                    entry = fn
-                    break
-            if entry is None:
-                raise RuntimeError("Autorender-now: Kein Entry-Point (t2e_app/render/main) gefunden.")
-            try:
-                entry()
-            except TypeError:
-                entry(st)
-
-            st.session_state._runner_autorun_done = True
-        except BaseException as e:
-            # Sichtbar machen statt still zu scheitern
-            import traceback
-            st.error(f"Autorender fehlgeschlagen: {e.__class__.__name__}: {e}")
-            st.code("".join(traceback.format_exc()))
-
-# ---- Ephemere Vorschläge direkt über dem Eingabefeld -------------------------
-def render_ephemeral_suggestions() -> None:
-    """
-    Zeigt aktuelle Vorschläge (falls vorhanden) als Buttons direkt über dem Eingabefeld.
-    Klick -> queued_input setzen, Vorschläge leeren, sofortiger rerun.
-    """
-    sugg = st.session_state.get("current_suggestions") or []
-    if not isinstance(sugg, list) or not sugg:
-        return
-
-    if st.session_state.get("_ephem_rendered_run_id") == st.session_state["_run_counter"]:
-        return
-
-    key_prefix = f"ep_sugg_{st.session_state['_run_counter']}_"
-
-    st.subheader("Vorschläge")
-    cols = st.columns(2)
-    for i, label in enumerate(sugg[:4]):
-        with cols[i % 2]:
-            if st.button(label, key=f"{key_prefix}{i}", use_container_width=True):
-                st.session_state["queued_input"] = label
-                st.session_state["current_suggestions"] = []
-                st.session_state["skip_agent_on_next_run"] = False
-                st.rerun()
-
-    st.session_state["_ephem_rendered_run_id"] = st.session_state["_run_counter"]
-
 st.set_page_config(page_title="talk2earth — EO Agent", layout="wide")
 st.title("talk2earth — EO Agent (Agents SDK + Streamlit)")
 
@@ -611,10 +515,9 @@ with st.sidebar:
     st.write("OPENAI_API_KEY gesetzt:", "✅" if os.environ.get("OPENAI_API_KEY") else "❌")
     st.write(f"Earth Engine: {'✅' if _EE_READY else '❌'}")
     st.divider()
-    st.caption("Antwortformat: Markdown + Suggestions + JSON (intern) + Code (unsichtbarer Preflight/Handoff).")
+    st.caption("Antwortformat: Markdown + Suggestions + JSON (intern) + Code (Preflight/Handoff mit Sanitizer).")
     st.divider()
 
-    # Ausführungsmodus (vereinfacht)
     mode_label = "Ausführungsmodus"
     options = ["Direkt ausführen", "Nur Preflight"]
     default_index = 0
@@ -623,7 +526,7 @@ with st.sidebar:
     sel = st.selectbox(mode_label, options, index=options.index(st.session_state["self_heal_mode"]))
     st.session_state["self_heal_mode"] = sel
     if sel == "Direkt ausführen":
-        st.caption("Code wird direkt übernommen und gerendert.")
+        st.caption("Code wird (nach Sanitizer) übernommen und gerendert.")
     else:
         st.caption("Nur Syntax-Preflight (kein Ausführen bei Fehlern).")
 
@@ -650,23 +553,75 @@ if "build_completed" not in st.session_state:
     st.session_state.build_completed = False
 if "current_suggestions" not in st.session_state:
     st.session_state.current_suggestions = []
+if "agent_session_id" not in st.session_state:
+    st.session_state.agent_session_id = uuid.uuid4().hex
+if "sdk_session" not in st.session_state and AGENTS_OK:
+    try:
+        SESSIONS_DB = str((RUNNER_DIR / "sessions.db").resolve())
+        st.session_state.sdk_session = SQLiteSession(st.session_state.agent_session_id, SESSIONS_DB)
+    except Exception:
+        st.session_state.sdk_session = SQLiteSession(st.session_state.agent_session_id)  # in-memory fallback
+sdk_session = st.session_state.get("sdk_session")
 
 # Pro-Run Marker
 st.session_state["_run_counter"] = st.session_state.get("_run_counter", 0) + 1
 st.session_state["_ephem_rendered_run_id"] = st.session_state.get("_ephem_rendered_run_id", -1)
 
-# UI-only Rerun Handling
-ui_only_rerun = False
-if st.session_state.get("skip_agent_on_next_run"):
-    st.session_state["skip_agent_on_next_run"] = False
-    ui_only_rerun = True
+# ---- Rendering Helper --------------------------------------------------------
+def autorender_now() -> None:
+    """Führt den aktuellen last_code *im render_slot* aus (ersetzt alte Anzeige)."""
+    slot = st.session_state.render_slot
+    slot.empty()
+    with slot.container():
+        try:
+            import ee  # falls oben im Scope
+        except Exception:
+            ee = None  # noqa: F401
+        ns: Dict[str, object] = {"__name__": "__generated__", "st": st}
+        if ee is not None:
+            ns["ee"] = ee
+        compiled = compile(st.session_state.last_code, "<autorender-now>", "exec")
+        exec(compiled, ns, ns)
+
+        entry = None
+        for fn_name in ("t2e_app", "render", "main"):
+            fn = ns.get(fn_name)
+            if callable(fn):
+                entry = fn
+                break
+        if entry is None:
+            raise RuntimeError("Autorender-now: Kein Entry-Point (t2e_app/render/main) gefunden.")
+        try:
+            entry()
+        except TypeError:
+            entry(st)
+
+    st.session_state._runner_autorun_done = True
+
+# ---- Ephemere Vorschläge -----------------------------------------------------
+def render_ephemeral_suggestions() -> None:
+    sugg = st.session_state.get("current_suggestions") or []
+    if not isinstance(sugg, list) or not sugg:
+        return
+    if st.session_state.get("_ephem_rendered_run_id") == st.session_state["_run_counter"]:
+        return
+    key_prefix = f"ep_sugg_{st.session_state['_run_counter']}_"
+    st.subheader("Vorschläge")
+    cols = st.columns(2)
+    for i, label in enumerate(sugg[:4]):
+        with cols[i % 2]:
+            if st.button(label, key=f"{key_prefix}{i}", use_container_width=True):
+                st.session_state["queued_input"] = label
+                st.session_state["current_suggestions"] = []
+                st.session_state["skip_agent_on_next_run"] = False
+                st.rerun()
+    st.session_state["_ephem_rendered_run_id"] = st.session_state["_run_counter"]
 
 # Verlauf anzeigen
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# Ephemere Vorschläge
 render_ephemeral_suggestions()
 
 # Eingabe
@@ -677,17 +632,19 @@ if queued:
 else:
     prompt = st.chat_input("Nachricht eingeben…")
 
-# Verliere keine Eingabe im UI-only Rerun
+# UI-only Rerun Handling
+ui_only_rerun = False
+if st.session_state.get("skip_agent_on_next_run"):
+    st.session_state["skip_agent_on_next_run"] = False
+    ui_only_rerun = True
+
 if ui_only_rerun and prompt:
     st.session_state["queued_input"] = prompt
     st.session_state["skip_agent_on_next_run"] = False
     st.rerun()
 
 if prompt and not ui_only_rerun:
-    # Vorschläge verwerfen (ephemer)
     st.session_state["current_suggestions"] = []
-
-    # User Nachricht
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -698,9 +655,7 @@ if prompt and not ui_only_rerun:
 
     ensure_event_loop()
 
-    # === Routing: vor/nach erstem Build ======================================
     if not st.session_state.get("build_completed", False):
-        # ---- Haupt-Agent: 4 Felder ------------------------------------------
         if APP_AGENT is None:
             st.error("Haupt-Agent nicht initialisiert.")
             st.stop()
@@ -724,22 +679,18 @@ if prompt and not ui_only_rerun:
             json_obj = getattr(out, "json", None)
             code_text = getattr(out, "code", None)
 
-        # 1) user_markdown
         if isinstance(user_md, str) and user_md.strip():
             with st.chat_message("assistant"):
                 st.markdown(user_md)
             st.session_state.messages.append({"role": "assistant", "content": user_md})
 
-        # 2) suggestions → sofort ephemer anzeigen
         if isinstance(suggestions, list) and suggestions:
             st.session_state["current_suggestions"] = [s for s in suggestions if isinstance(s, str) and s.strip()][:4]
             render_ephemeral_suggestions()
 
-        # 3) JSON → persistieren
         if isinstance(json_obj, dict):
             st.session_state["last_json"] = json_obj
 
-        # 4) code → Preflight/Handoff + Moduswechsel
         handoff_done = False
         attempted_build = False
         ok = False
@@ -753,14 +704,13 @@ if prompt and not ui_only_rerun:
                 handoff_done = True
             else:
                 with st.chat_message("assistant"):
-                    st.markdown("Der Code konnte nicht ausgeführt werden (kein Auto-Fix aktiv). Bitte Parameter anpassen oder erneut versuchen.")
+                    st.markdown("Der Code konnte nicht ausgeführt werden. Ich habe problematische Stellen bereits bereinigt – passe ggf. die Parameter an und versuche es erneut.")
 
         if handoff_done:
             st.session_state["skip_agent_on_next_run"] = True
             st.rerun()
 
     else:
-        # ---- Refactor-Agent (One-Run Vollcode) -------------------------------
         if REFACTOR_AGENT is None:
             st.error("Refactor-Agent nicht initialisiert.")
             st.stop()
@@ -813,7 +763,7 @@ if prompt and not ui_only_rerun:
                 handoff_done = True
             else:
                 with st.chat_message("assistant"):
-                    st.markdown("Die Änderung führte zu Fehlern (kein Auto-Fix aktiv). Bitte genauer spezifizieren oder Parameter anpassen.")
+                    st.markdown("Die Änderung führte zu Fehlern. Die typischen Stolpersteine (Main-Guard, Future-Import, set_page_config) wurden bereits bereinigt – bitte erneut auslösen.")
 
         if handoff_done:
             st.session_state["skip_agent_on_next_run"] = True
@@ -844,8 +794,5 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
 
         st.session_state._runner_autorun_done = True
         st.sidebar.caption("Runner automatisch gestartet.")
-    except BaseException as e:
-        import traceback
+    except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
-        st.error(f"Auto-Render Exception: {e.__class__.__name__}: {e}")
-        st.code("".join(traceback.format_exc()))
