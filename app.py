@@ -838,7 +838,7 @@ if prompt and not ui_only_rerun:
         # 4) code → Preflight/Fixer/Autorender + Moduswechsel
         handoff_done = False
         if isinstance(code_text, str) and code_text.strip():
-        ok = preflight_and_switch(code_text)
+            ok = preflight_and_switch(code_text)
         if ok:
             handoff_done = True
         else:
@@ -974,6 +974,7 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
         st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
+
 
 
 
