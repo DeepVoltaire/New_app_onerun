@@ -864,9 +864,13 @@ def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str
             return True, current, logs
         logs.append(out)
         fixed = _sh_fix_code_once(current, out)
-        if not fixed or fixed.strip() == current.strip():
+
+        # Robust: Nur vergleichen, wenn wirklich ein String vorliegt
+        if not isinstance(fixed, str) or not fixed.strip() or fixed.strip() == current.strip():
             break
+
         current = fixed
+
     # letzter Versuch
     ok, out = _sh_sandbox_exec(current)
     logs.append(out)
@@ -1141,5 +1145,6 @@ if (('skip_agent_on_next_run' in st.session_state and not st.session_state['skip
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
+
 
 
