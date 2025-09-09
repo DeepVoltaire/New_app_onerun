@@ -74,7 +74,8 @@ def ensure_event_loop() -> None:
 # Erkenner
 _COMPONENT_BEGIN_RE = re.compile(r"^\s*#\s*====\s*BEGIN\s+COMPONENT:", re.MULTILINE)
 _FROM_BLOCKS_IMPORT_RE = re.compile(
-    r"^\s*from\s+blocks\.components\.[^\n]+\s+import\s+[^\n]+$", re.MULTILINE
+    r"^\s*from\s+blocks\.components\.[^\n]+\s+import\s+[^\n]+$",
+    re.MULTILINE
 )
 
 # Muster, die wir normalisieren
@@ -86,7 +87,7 @@ _SANITIZE_SIMPLE_RULES: Tuple[Tuple[str, str], ...] = (
 def _normalize_region_markers(text: str) -> str:
     # rohe "region BLOCK …" → "# region BLOCK …"
     text = re.sub(r"(?m)^(?P<pre>\s*)(region\s+BLOCK\s+id=)", r"\g<pre># \2", text)
-    # rohe "endregion BLOCK …" → "# endregion BLOCK …"
+    # rohe "endregion BLOCK …" → "# endregion BLOCK …
     text = re.sub(r"(?m)^(?P<pre>\s*)(endregion\s+BLOCK\s+id=)", r"\g<pre># \2", text)
     return text
 
@@ -107,7 +108,6 @@ def sanitize_code(code_text: str) -> str:
     """Robuste Sanitisierung für Agent/Fixer-Ausgaben."""
     if not isinstance(code_text, str):
         return code_text
-
     s = code_text
 
     # 1) Region-Marker ohne Kommentarzeichen nachrüsten
@@ -131,7 +131,6 @@ def sanitize_code(code_text: str) -> str:
 
 # ===== Patch-/Marker-Helpers ===================================================
 _REGION_RE = re.compile(r"^\s*#\s*region\s+BLOCK\s+id\s*=", re.MULTILINE)
-
 def _normalize_patches_list(patches_in) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for p in patches_in or []:
@@ -435,13 +434,75 @@ tool_run_python = function_tool(_tool_run_python_impl)
 # ---------- Addendum: Haupt-Agent (4-Felder-Protokoll) ----------
 APP_AGENT_ADDENDUM = """
 [OUTPUT PROTOKOLL — HAUPT-AGENT · STRICT]
-...
+
+Du gibst deinen Output IMMER als strukturiertes Objekt mit bis zu vier Feldern zurück:
+
+1) user_markdown (string)
+   - Sichtbarer, natürlicher Text für die Person.
+   - Keine Code-Fences, kein JSON, keine Marker.
+   - Kurz und menschlich: Orientierung, Rückfragen oder Bestätigung.
+   - Wenn alles klar ist (Stop-Kriterien erfüllt), ein kurzer Satz: „Ich baue dir …“
+
+2) suggestions (array of string, max 4)
+   - Bis zu vier ergänzende, klickbare Vorschläge.
+   - Kurz, handlungsorientiert, konsistent mit user_markdown.
+   - Beispiele: „Nimm Juli 2023“, „Erweitere Umkreis auf 20 km“, „Zeige Vergleich links/rechts“.
+
+3) json (object)
+   - Nur intern, niemals anzeigen.
+   - Container für strukturierte Daten wie:
+     - plan_spec (gemäß Abschnitt 15.2)
+     - block_index (Liste der Code-Blöcke mit Metadaten)
+     - components_manifest (Liste der verwendeten Komponenten inkl. Hash/Bytes)
+     - policy_notes (interne Korrekturen/Begründungen)
+   - Strikt valides JSON. Keine Kommentare, keine Erklärsätze.
+
+4) code (string)
+   - Vollständiger, lauffähiger Python-Quelltext, ohne Markdown-Fences.
+   - Alle ausführbaren Teile liegen in markierten Regionen:
+     # region BLOCK id=... kind=... phase=... name="..." plan_ref="..." hash=... modifiable=<yes|no>
+     ... Body ...
+     # endregion BLOCK id=...
+   - Ein einziger Entry-Point (def main(): …), keine EE-Init/Auth im Code.
+   - UI optional, GEE-first, Render nur in main(), nichts beim Import.
+   - Nur ausgeben, wenn die Stop-Kriterien erfüllt sind (siehe Abschnitt 12).
+
+SICHTBARKEIT:
+- user_markdown und suggestions → sichtbar.
+- json und code → niemals direkt im Chat anzeigen.
+
+PLAN_SPEC:
+- Falls Richtung/Parameter klar (Stop-Kriterien erfüllt): lege PLAN_SPEC streng nach Abschnitt 15.2 in json.plan_spec ab.
+- Fehlen Pflichtangaben: stelle Rückfragen in user_markdown und gib KEIN json.plan_spec aus.
+- Niemals PLAN_SPEC als Text ausgeben.
 """
 
 # ---------- Addendum: Refactor-Agent (Patch-Only) ----------
 REFACTOR_ADDENDUM = """
 [REFACTOR-MODUS · PATCH-ONLY]
-...
+
+Kontextquellen (vom Host übergeben):
+- CURRENT_CODE (vollständiger, aktuell laufender Code mit Block-Markern).
+- json.block_index (Struktur und Metadaten der vorhandenen Blöcke).
+- json.plan_spec (Plan-Spezifikation des aktuellen Builds).
+- json.components_manifest (verwendete Komponenten/Hashes).
+
+Dein Output ist strikt ein strukturiertes Objekt:
+{
+  "user_markdown": "<optional sichtbarer Text>",
+  "suggestions": ["<max 4 kurze Vorschläge>"],
+  "patches": [
+    { "block_id": "<id>", "new_code": "<GANZER Body ohne Marker>", "old_hash": "<optional>", "notes": "<optional>" }
+  ]
+}
+
+Regeln:
+- Nur Block-BODIES patchen, keine Marker mitsenden.
+- Minimal-invasiv: nur angefragte Blöcke oder solche mit modifiable=yes ändern.
+- Öffentliche Signaturen erhalten, keine neuen Abhängigkeiten, keine EE-Init/Auth.
+- Keine neuen Blöcke anlegen, außer die Person bestätigt dies explizit.
+- Wenn eine Änderung neue Blöcke erfordert: zuerst um Zustimmung bitten (in user_markdown), dann Patch liefern.
+- Niemals Vollcode ausgeben. Keine JSON/Code-Fences im sichtbaren Text.
 """
 
 # ---------- Output-Schemas ----------
@@ -477,6 +538,7 @@ APP_AGENT = None
 REFACTOR_AGENT = None
 
 if AGENTS_OK:
+    # Haupt-Agent: Mega-Prompt + 4-Felder-Addendum
     APP_AGENT = Agent(
         name="EO-AppAgent",
         instructions=MEGA_PROMPT + "\n\n" + APP_AGENT_ADDENDUM,
@@ -488,6 +550,7 @@ if AGENTS_OK:
         output_type=AgentOutputSchema(UiResponse, strict_json_schema=False),
     )
 
+    # Refactor-Agent: Mega-Prompt + Patch-Only-Addendum
     REFACTOR_AGENT = Agent(
         name="EO-Refactor",
         instructions=MEGA_PROMPT + "\n\n" + REFACTOR_ADDENDUM,
@@ -503,8 +566,15 @@ if AGENTS_OK:
 import sys as _sh_sys
 import io as _sh_io
 
+# --- Import-sicherer Shim: verhindert NameError, falls vorzeitig aufgerufen ---
 if "self_heal_until_runs" not in globals():
     def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str, List[str]]:
+        """
+        Import-sicherer Minimal-Stub:
+        Wird NUR benötigt, falls an anderer Stelle (vor nachstehender echter Definition)
+        bereits auf self_heal_until_runs zugegriffen wird.
+        Führt KEINE Heilung aus, verhindert aber NameError beim Import.
+        """
         return True, code_text, []
 
 DEFAULT_MAX_TURNS = 12
@@ -582,6 +652,7 @@ def _sh_fix_code_once(code_text: str, error_log: str) -> Optional[str]:
     except Exception:
         return None
 
+
 def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
     buf = _sh_io.StringIO()
     _stdout, _stderr = _sh_sys.stdout, _sh_sys.stderr
@@ -618,6 +689,9 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
         _sh_sys.stdout = _stdout
         _sh_sys.stderr = _stderr
     return ok_out, text_out
+
+
+
 
 def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str, List[str]]:
     logs: List[str] = []
@@ -674,13 +748,13 @@ def preflight_and_switch(code_text: str) -> bool:
     st.session_state._runner_autorun_done = False
     st.session_state.build_completed = True
     st.session_state.refactor_mode = True
-
     try:
         autorender_now()
     except Exception:
         return False
 
     return True
+
 
 # ===== Session / SDK-Session ==================================================
 if AGENTS_OK:
@@ -691,18 +765,20 @@ if AGENTS_OK:
             SESSIONS_DB = str((RUNNER_DIR / "sessions.db").resolve())
             st.session_state.sdk_session = SQLiteSession(st.session_state.agent_session_id, SESSIONS_DB)
     except Exception:
+        # Fallback *persistiert* ebenfalls im Session State (verhindert Neuaufbau pro Run)
         if "sdk_session" not in st.session_state:
-            st.session_state.sdk_session = SQLiteSession(st.session_state.agent_session_id)
+            st.session_state.sdk_session = SQLiteSession(st.session_state.agent_session_id)  # in-memory fallback
     sdk_session = st.session_state.sdk_session
 else:
     sdk_session = None  # type: ignore
 
 # ===== UI =====================================================================
 
+
 def autorender_now() -> None:
     """Führt den aktuellen last_code *im render_slot* aus (ersetzt alte Anzeige)."""
     slot = st.session_state.render_slot
-    slot.empty()
+    slot.empty()  # alte Mini-App entfernen
     with slot.container():
         try:
             import ee  # falls oben im Scope
@@ -729,20 +805,42 @@ def autorender_now() -> None:
 
     st.session_state._runner_autorun_done = True
 
+
+# ---- NEU: Ephemere Vorschläge direkt über dem Eingabefeld --------------------
 def render_ephemeral_suggestions() -> None:
+    """
+    Zeigt aktuelle Vorschläge (falls vorhanden) als Buttons direkt über dem Eingabefeld.
+    Klick -> queued_input setzen, Vorschläge leeren, sofortiger rerun.
+    Sorgt dafür, dass:
+      - Keys pro Run eindeutig sind (via _run_counter),
+      - Buttons maximal EINMAL pro Run gerendert werden (aber nur, wenn es Vorschläge gibt).
+    """
     sugg = st.session_state.get("current_suggestions") or []
     if not isinstance(sugg, list) or not sugg:
+        # Nichts zu rendern -> auch keinen Render-Merker setzen
         return
+
+    # Schon in diesem Run gerendert? -> Abbrechen (verhindert Duplicate Keys)
+    if st.session_state.get("_ephem_rendered_run_id") == st.session_state["_run_counter"]:
+        return
+
+    # Eindeutiger Prefix je Run
+    key_prefix = f"ep_sugg_{st.session_state['_run_counter']}_"
 
     st.subheader("Vorschläge")
     cols = st.columns(2)
     for i, label in enumerate(sugg[:4]):
         with cols[i % 2]:
-            if st.button(label, key=f"ep_sugg_{i}", use_container_width=True):
+            # Key enthält die run-weit eindeutige Nummer + Index
+            if st.button(label, key=f"{key_prefix}{i}", use_container_width=True):
                 st.session_state["queued_input"] = label
                 st.session_state["current_suggestions"] = []
                 st.session_state["skip_agent_on_next_run"] = False
                 st.rerun()
+
+    # Merken: in DIESEM Run gerendert (damit ein zweiter Render im selben Run aussetzt)
+    st.session_state["_ephem_rendered_run_id"] = st.session_state["_run_counter"]
+
 
 st.set_page_config(page_title="talk2earth — EO Agent", layout="wide")
 st.title("talk2earth — EO Agent (Agents SDK + Streamlit)")
@@ -770,9 +868,11 @@ with st.sidebar:
     else:
         st.caption("Kein Preflight. Code sofort ausführen.")
 
+# Zentraler Render-Platzhalter, in den die Mini-App *immer* gerendert wird
 if "render_slot" not in st.session_state:
     st.session_state.render_slot = st.empty()
 
+# Session-States
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "last_code" not in st.session_state:
@@ -789,20 +889,30 @@ if "refactor_mode" not in st.session_state:
     st.session_state.refactor_mode = False
 if "build_completed" not in st.session_state:
     st.session_state.build_completed = False
+# NEU: ephemere Vorschläge
 if "current_suggestions" not in st.session_state:
     st.session_state.current_suggestions = []
 
+# --- Pro-Run Marker für eindeutige Widget-Keys und Doppel-Render-Guard ---
+st.session_state["_run_counter"] = st.session_state.get("_run_counter", 0) + 1
+# Merker: in DIESEM Run schon Vorschlags-Buttons gerendert?
+st.session_state["_ephem_rendered_run_id"] = st.session_state.get("_ephem_rendered_run_id", -1)
+
+# --- UI-only Rerun Handling (einmalige Entkopplung des Autorender-Reruns) ---
 ui_only_rerun = False
 if st.session_state.get("skip_agent_on_next_run"):
     st.session_state["skip_agent_on_next_run"] = False
     ui_only_rerun = True
 
+# Verlauf anzeigen
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
+# ---- Ephemere Vorschläge (direkt über dem Eingabefeld) -----------------------
 render_ephemeral_suggestions()
 
+# Eingabe
 queued = st.session_state.get("queued_input")
 if queued:
     st.session_state["queued_input"] = None
@@ -810,14 +920,17 @@ if queued:
 else:
     prompt = st.chat_input("Nachricht eingeben…")
 
+# Verliere keine Eingabe im UI-only Rerun: Puffer + sofort rerun
 if ui_only_rerun and prompt:
     st.session_state["queued_input"] = prompt
     st.session_state["skip_agent_on_next_run"] = False
     st.rerun()
 
 if prompt and not ui_only_rerun:
+    # Wenn echte Eingabe startet, alte Vorschläge verwerfen (ephemer)
     st.session_state["current_suggestions"] = []
 
+    # User Nachricht
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -828,7 +941,9 @@ if prompt and not ui_only_rerun:
 
     ensure_event_loop()
 
+    # === Routing: vor/nach erstem Build ======================================
     if not st.session_state.get("build_completed", False):
+        # ---- Haupt-Agent: 4 Felder ------------------------------------------
         if APP_AGENT is None:
             st.error("Haupt-Agent nicht initialisiert.")
             st.stop()
@@ -852,18 +967,23 @@ if prompt and not ui_only_rerun:
             json_obj = getattr(out, "json", None)
             code_text = getattr(out, "code", None)
 
+        # 1) user_markdown
         if isinstance(user_md, str) and user_md.strip():
             with st.chat_message("assistant"):
                 st.markdown(user_md)
             st.session_state.messages.append({"role": "assistant", "content": user_md})
 
+        # 2) suggestions → sofort ephemer anzeigen (gleicher Run)
         if isinstance(suggestions, list) and suggestions:
             st.session_state["current_suggestions"] = [s for s in suggestions if isinstance(s, str) and s.strip()][:4]
+            # direkt rendern, ohne Rerun
             render_ephemeral_suggestions()
 
+        # 3) JSON → nur persistieren (kann plan_spec, block_index, components_manifest enthalten)
         if isinstance(json_obj, dict):
             st.session_state["last_json"] = json_obj
 
+        # 4) code → Preflight/Fixer/Autorender + Moduswechsel
         handoff_done = False
         attempted_build = False
         ok = False
@@ -884,10 +1004,12 @@ if prompt and not ui_only_rerun:
             st.rerun()
 
     else:
+        # ---- Refactor-Agent (Agent 2): Patches only --------------------------
         if REFACTOR_AGENT is None:
             st.error("Refactor-Agent nicht initialisiert.")
             st.stop()
 
+        # Kontext für Agent 2 zusammenstellen
         ctx_json = st.session_state.get("last_json") or {}
         ctx_payload = {
             "user_change_request": prompt,
@@ -914,15 +1036,18 @@ if prompt and not ui_only_rerun:
             suggestions = getattr(patches_out, "suggestions", None)
             patches = getattr(patches_out, "patches", []) or []
 
+        # Sichtbar: user_markdown
         if isinstance(user_md, str) and user_md.strip():
             with st.chat_message("assistant"):
                 st.markdown(user_md)
             st.session_state.messages.append({"role": "assistant", "content": user_md})
 
+        # Vorschläge → sofort ephemer anzeigen (gleicher Run)
         if isinstance(suggestions, list) and suggestions:
             st.session_state["current_suggestions"] = [s for s in suggestions if isinstance(s, str) and s.strip()][:4]
             render_ephemeral_suggestions()
 
+        # Patches anwenden → Preflight → Autorender
         handoff_done = False
         if patches:
             patches_dicts = _normalize_patches_list(patches)
@@ -934,6 +1059,7 @@ if prompt and not ui_only_rerun:
                     patched = sanitize_code(patched)
                     ok = preflight_and_switch(patched)
                     if ok:
+                        # OPTIONAL: neuen block_index übernehmen, falls vorhanden
                         if isinstance(patches_out, dict):
                             new_block_index = patches_out.get("block_index")
                             if new_block_index:
