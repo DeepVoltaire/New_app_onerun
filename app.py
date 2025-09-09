@@ -14,6 +14,7 @@ from blocks.components.util.block_marker_utils import apply_patches, build_block
 
 import streamlit as st
 import asyncio
+import sys  # für sys.path-Injektion im Autorender/Sandbox
 
 # ===== Pfade / Repo-Layout ====================================================
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
@@ -57,11 +58,14 @@ MEGA_PROMPT = load_text_file(
 )
 
 # ===== Util ===================================================================
+
 def _sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
 
+
 def _safe_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False)
+
 
 def ensure_event_loop() -> None:
     try:
@@ -72,6 +76,7 @@ def ensure_event_loop() -> None:
 
 
 # ===== Patch-/Marker-Helpers ===================================================
+
 def _normalize_patches_list(patches_in) -> List[Dict[str, Any]]:
     """Akzeptiert Pydantic-Objekte (PatchItem) ODER dicts und liefert List[dict]."""
     out: List[Dict[str, Any]] = []
@@ -88,9 +93,13 @@ def _normalize_patches_list(patches_in) -> List[Dict[str, Any]]:
     # nur valide Einträge
     return [d for d in out if d.get("block_id") and isinstance(d.get("new_code"), str)]
 
+
 _REGION_RE = re.compile(r"^\s*#\s*region\s+BLOCK\s+id\s*=", re.MULTILINE)
+
+
 def _has_region_markers(code_text: str) -> bool:
     return bool(_REGION_RE.search(code_text or ""))
+
 
 def _looks_like_full_program(snippet: str) -> bool:
     """Ein Patch kann fälschlich Vollcode enthalten -> heuristisch erkennen."""
@@ -102,9 +111,30 @@ def _looks_like_full_program(snippet: str) -> bool:
         s.startswith("from __future__ import annotations")
         or s.startswith("import ")
         or "def main(" in s
-        or "# ==== BUNDLED COMPONENTS BEGIN ====" in s
+        or "# ==== BUNDLED COMPONENTS BEGIN ====\n" in s
     )
 
+
+# ===== Code-Sanitizer (immer vor jedem Run anwenden) ==========================
+_SANITIZE_RULES: Tuple[Tuple[str, str], ...] = (
+    (r"^\s*from\s+future\s+import\s+annotations", "from __future__ import annotations"),
+    (r"\bif\s+name\s*==\s*["]main["]\s*:", "if __name__ == \"__main__\":"),
+)
+
+
+def sanitize_agent_code(src: str) -> str:
+    """Korrigiert häufige Generator-Fehler (future/import, main-guard). Idempotent."""
+    if not isinstance(src, str) or not src.strip():
+        return src
+    out = src
+    for pat, repl in _SANITIZE_RULES:
+        out = re.sub(pat, repl, out, flags=re.MULTILINE)
+    # Sicherstellen, dass __future__ ganz oben steht (einmalig)
+    lines = out.splitlines()
+    has_future = any(l.strip() == "from __future__ import annotations" for l in lines[:5])
+    if not has_future:
+        out = "from __future__ import annotations\n" + out
+    return out
 
 
 # ===== Earth Engine (Host-Init) ===============================================
@@ -113,6 +143,7 @@ try:
     import ee
 except Exception:
     EE_OK = False
+
 
 def ee_maybe_init() -> bool:
     if not EE_OK:
@@ -158,6 +189,7 @@ def ee_maybe_init() -> bool:
     except Exception:
         return False
 
+
 _EE_READY = ee_maybe_init()
 
 # ===== Tools ==================================================================
@@ -167,11 +199,13 @@ def tool_get_meta() -> str:
         return _safe_json({"error": f"meta index not found: {META_INDEX_PATH}"})
     return META_INDEX_PATH.read_text(encoding="utf-8")
 
+
 @function_tool
 def tool_get_policy() -> str:
     if not POLICY_PATH.exists():
         return _safe_json({"error": f"policy not found: {POLICY_PATH}"})
     return POLICY_PATH.read_text(encoding="utf-8")
+
 
 @function_tool
 def tool_get_uc_sections(uc_id: str, sections: List[str]) -> str:
@@ -180,7 +214,7 @@ def tool_get_uc_sections(uc_id: str, sections: List[str]) -> str:
     except Exception:
         return _safe_json({
             "error": "missing_dependency",
-            "detail": "PyYAML ist erforderlich. Füge 'pyyaml' zu requirements.txt hinzu."
+            "detail": "PyYAML ist erforderlich. Füge 'pyyaml' zu requirements.txt hinzu.",
         })
     uc_path = USECASES_DIR / f"{uc_id}.yml"
     if not uc_path.exists():
@@ -194,6 +228,7 @@ def tool_get_uc_sections(uc_id: str, sections: List[str]) -> str:
         if sec in data:
             out[sec] = data[sec]
     return _safe_json(out)
+
 
 @function_tool
 def tool_bundle_components(components: List[str]) -> str:
@@ -229,12 +264,15 @@ def tool_bundle_components(components: List[str]) -> str:
 
     return _safe_json({"bundle": "\n".join(bundle_parts), "manifest": manifest})
 
-def _tool_run_python_impl(code: str,
-                          filename: Optional[str] = None,
-                          timeout_sec: int = 600,
-                          mode: str = "script",
-                          port: int = 8502,
-                          preflight_only: bool = False) -> str:
+
+def _tool_run_python_impl(
+    code: str,
+    filename: Optional[str] = None,
+    timeout_sec: int = 600,
+    mode: str = "script",
+    port: int = 8502,
+    preflight_only: bool = False,
+) -> str:
     if not filename:
         filename = "app_run.py"
 
@@ -286,7 +324,8 @@ def _tool_run_python_impl(code: str,
         except Exception:
             return ee_prelude + (user_code or "")
 
-    code_to_write = (code or "")
+    # --- NEU: Code immer erst sanitisieren, egal aus welcher Quelle ---
+    code_to_write = sanitize_agent_code(code or "")
     if not preflight_only:
         code_to_write = _merge_with_future_first(code_to_write)
 
@@ -321,7 +360,7 @@ def _tool_run_python_impl(code: str,
                 "stdout": proc.stdout[-15000:],
                 "stderr": proc.stderr[-15000:],
                 "path": str(target),
-                "mode": "py_compile"
+                "mode": "py_compile",
             }, ensure_ascii=False)
         except subprocess.TimeoutExpired as e:
             return json.dumps({
@@ -329,7 +368,7 @@ def _tool_run_python_impl(code: str,
                 "stdout": (getattr(e, "stdout", "") or "")[-15000:],
                 "stderr": f"TIMEOUT after {timeout_sec}s (py_compile)",
                 "path": str(target),
-                "mode": "py_compile"
+                "mode": "py_compile",
             }, ensure_ascii=False)
 
     if mode == "script":
@@ -344,20 +383,29 @@ def _tool_run_python_impl(code: str,
             )
         except subprocess.TimeoutExpired as e:
             return json.dumps({
-                "ok": False, "stdout": (getattr(e, "stdout", "") or "")[-15000:], "stderr": f"TIMEOUT after {timeout_sec}s",
-                "path": str(target), "mode": "script"
+                "ok": False,
+                "stdout": (getattr(e, "stdout", "") or "")[-15000:],
+                "stderr": f"TIMEOUT after {timeout_sec}s",
+                "path": str(target),
+                "mode": "script",
             }, ensure_ascii=False)
         return json.dumps({
             "ok": proc.returncode == 0,
-            "stdout": proc.stdout[-15000:], "stderr": proc.stderr[-15000:],
-            "path": str(target), "mode": "script"
+            "stdout": proc.stdout[-15000:],
+            "stderr": proc.stderr[-15000:],
+            "path": str(target),
+            "mode": "script",
         }, ensure_ascii=False)
 
     if mode == "streamlit":
         try:
             proc = subprocess.Popen(
                 ["streamlit", "run", str(target), "--server.headless", "true", "--server.port", str(port)],
-                cwd=SANDBOX_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                cwd=SANDBOX_DIR,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
             )
             try:
                 bootstrap = proc.stdout.readline().strip() if proc.stdout else ""
@@ -365,16 +413,24 @@ def _tool_run_python_impl(code: str,
                 bootstrap = ""
             url = f"http://localhost:{port}"
             return json.dumps({
-                "ok": True, "url": url, "pid": proc.pid, "path": str(target),
+                "ok": True,
+                "url": url,
+                "pid": proc.pid,
+                "path": str(target),
                 "hint": "Zweite Streamlit-Instanz ist auf Cloud-Hosts i. d. R. nicht erreichbar.",
-                "mode": "streamlit", "bootstrap_log": bootstrap[-2000:]
+                "mode": "streamlit",
+                "bootstrap_log": bootstrap[-2000:],
             }, ensure_ascii=False)
         except Exception as e:
             return json.dumps({
-                "ok": False, "error": f"Failed to start streamlit: {e}", "path": str(target), "mode": "streamlit"
+                "ok": False,
+                "error": f"Failed to start streamlit: {e}",
+                "path": str(target),
+                "mode": "streamlit",
             }, ensure_ascii=False)
 
     return json.dumps({"error": f"unknown mode '{mode}'"})
+
 
 tool_run_python = function_tool(_tool_run_python_impl)
 
@@ -385,8 +441,7 @@ APP_AGENT_ADDENDUM = """
 Du gibst deinen Output IMMER als strukturiertes Objekt mit bis zu vier Feldern zurück:
 
 1) user_markdown (string)
-   - Sichtbarer, natürlicher Text für die Person.
-   - Keine Code-Fences, kein JSON, keine Marker.
+   - Sichtbarer, natürlicher Text für den Chat. Kein Code-Fence.
    - Kurz und menschlich: Orientierung, Rückfragen oder Bestätigung.
    - Wenn alles klar ist (Stop-Kriterien erfüllt), ein kurzer Satz: „Ich baue dir …“
 
@@ -459,10 +514,12 @@ class UiResponse(BaseModel):
     json: Optional[Dict[str, Any]] = Field(default=None, description="Interner JSON-Block (z. B. plan_spec, block_index, components_manifest). Niemals anzeigen.")
     code: Optional[str] = Field(default=None, description="Vollständiger Python-Code (ohne Markdown-Fences).")
 
+
 try:
     UiResponse.model_rebuild()
 except Exception:
     pass
+
 
 class PatchItem(BaseModel):
     block_id: str
@@ -470,10 +527,12 @@ class PatchItem(BaseModel):
     old_hash: Optional[str] = None
     notes: Optional[str] = None
 
+
 class RefactorResponse(BaseModel):
     user_markdown: Optional[str] = None
     suggestions: Optional[List[str]] = None
     patches: List[PatchItem]
+
 
 try:
     RefactorResponse.model_rebuild()
@@ -492,7 +551,7 @@ if AGENTS_OK:
         tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python],
         model=OpenAIResponsesModel(
             model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
-            openai_client=openai_client
+            openai_client=openai_client,
         ),
         output_type=AgentOutputSchema(UiResponse, strict_json_schema=False),
     )
@@ -504,10 +563,11 @@ if AGENTS_OK:
         tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components],
         model=OpenAIResponsesModel(
             model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
-            openai_client=openai_client
+            openai_client=openai_client,
         ),
         output_type=AgentOutputSchema(RefactorResponse, strict_json_schema=True),
     )
+
 # ===== Self-Heal / Fixer (separat, nur intern) ================================
 import sys as _sh_sys
 import io as _sh_io
@@ -522,6 +582,7 @@ if "self_heal_until_runs" not in globals():
         Führt KEINE Heilung aus, verhindert aber NameError beim Import.
         """
         return True, code_text, []
+
 
 DEFAULT_MAX_TURNS = 12
 
@@ -545,8 +606,10 @@ REQUIRED CODE SHAPE:
 - Do not call m.to_streamlit()/st.* outside of main().
 """
 
+
 class PythonBlockOutput(BaseModel):
     code: str
+
 
 def _sh_get_fixer_agent():
     if not AGENTS_OK:
@@ -555,6 +618,7 @@ def _sh_get_fixer_agent():
         return st.session_state["_fixer_agent"]
     from agents import Agent as _sh_Agent
     from agents.models.openai_responses import OpenAIResponsesModel as _sh_Model
+
     fixer_agent = _sh_Agent(  # type: ignore
         name="Fixer",
         model=_sh_Model(  # type: ignore
@@ -567,6 +631,7 @@ def _sh_get_fixer_agent():
     )
     st.session_state["_fixer_agent"] = fixer_agent
     return fixer_agent
+
 
 def _sh_fix_code_once(code_text: str, error_log: str) -> Optional[str]:
     ensure_event_loop()
@@ -607,9 +672,14 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
     try:
         _sh_sys.stdout = buf
         _sh_sys.stderr = buf
-
+        # --- NEU: sys.path und Sanitizing für Sandbox-Exec ---
+        try:
+            _sh_sys.path.insert(0, str(BASE_DIR))
+        except Exception:
+            pass
+        safe_code = sanitize_agent_code(code_text)
         ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
-        compiled = compile(code_text, "<healed>", "exec")
+        compiled = compile(safe_code, "<healed>", "exec")
         exec(compiled, ns, ns)
 
         entry = None
@@ -638,10 +708,9 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
 
 
 
-
 def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str, List[str]]:
     logs: List[str] = []
-    current = code_text
+    current = sanitize_agent_code(code_text)
     for _i in range(1, max_rounds + 1):
         ok, out = _sh_sandbox_exec(current)
         if ok:
@@ -650,13 +719,15 @@ def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str
         fixed = _sh_fix_code_once(current, out)
         if not fixed or fixed.strip() == current.strip():
             break
-        current = fixed
+        current = sanitize_agent_code(fixed)
     ok, out = _sh_sandbox_exec(current)
     logs.append(out)
     return ok, current, logs
 
+
 def preflight_and_switch(code_text: str) -> bool:
-    ok, final_code, _heal = self_heal_until_runs(code_text, max_rounds=5)
+    # --- NEU: Vor dem Heilen einmal sanitisieren ---
+    ok, final_code, _heal = self_heal_until_runs(sanitize_agent_code(code_text), max_rounds=5)
     if not ok:
         return False
 
@@ -702,27 +773,37 @@ def autorender_now() -> None:
     slot.empty()  # alte Mini-App entfernen
     with slot.container():
         try:
-            import ee  # falls oben im Scope
-        except Exception:
-            ee = None  # noqa: F401
-        ns: Dict[str, object] = {"__name__": "__generated__", "st": st}
-        if ee is not None:
-            ns["ee"] = ee
-        compiled = compile(st.session_state.last_code, "<autorender-now>", "exec")
-        exec(compiled, ns, ns)
+            # --- NEU: sys.path und Sanitizing auch hier ---
+            try:
+                sys.path.insert(0, str(BASE_DIR))
+            except Exception:
+                pass
+            try:
+                import ee  # falls oben im Scope
+            except Exception:
+                ee = None  # noqa: F401
+            safe_code = sanitize_agent_code(st.session_state.last_code)
+            ns: Dict[str, object] = {"__name__": "__generated__", "st": st}
+            if ee is not None:
+                ns["ee"] = ee
+            compiled = compile(safe_code, "<autorender-now>", "exec")
+            exec(compiled, ns, ns)
 
-        entry = None
-        for fn_name in ("t2e_app", "render", "main"):
-            fn = ns.get(fn_name)
-            if callable(fn):
-                entry = fn
-                break
-        if entry is None:
-            raise RuntimeError("Autorender-now: Kein Entry-Point (t2e_app/render/main) gefunden.")
-        try:
-            entry()
-        except TypeError:
-            entry(st)
+            entry = None
+            for fn_name in ("t2e_app", "render", "main"):
+                fn = ns.get(fn_name)
+                if callable(fn):
+                    entry = fn
+                    break
+            if entry is None:
+                raise RuntimeError("Autorender-now: Kein Entry-Point (t2e_app/render/main) gefunden.")
+            try:
+                entry()
+            except TypeError:
+                entry(st)
+        except BaseException as e:
+            st.error(f"Autorender fehlgeschlagen: {e.__class__.__name__}: {e}")
+            st.exception(e)
 
     st.session_state._runner_autorun_done = True
 
@@ -979,8 +1060,14 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
         slot = st.session_state.render_slot
         slot.empty()
         with slot.container():
+            # --- NEU: sys.path + Sanitizing + klarer Fehlerauswurf ---
+            try:
+                sys.path.insert(0, str(BASE_DIR))
+            except Exception:
+                pass
+            safe_code = sanitize_agent_code(st.session_state.last_code)
             ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
-            compiled = compile(st.session_state.last_code, "<autorender>", "exec")
+            compiled = compile(safe_code, "<autorender>", "exec")
             exec(compiled, ns, ns)
 
             entry = None
@@ -998,5 +1085,6 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
 
         st.session_state._runner_autorun_done = True
         st.sidebar.caption("Runner automatisch gestartet.")
-    except BaseException:
-        st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
+    except BaseException as e:
+        st.sidebar.warning(f"Auto-Render fehlgeschlagen – {e.__class__.__name__}: {e}")
+        st.exception(e)
