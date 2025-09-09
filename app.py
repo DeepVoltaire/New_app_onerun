@@ -509,33 +509,7 @@ PLAN_SPEC:
 - Niemals PLAN_SPEC als Text ausgeben.
 """
 
-# ---------- Addendum: Refactor-Agent (One-Run Vollcode-Output) ----------
-REFACTOR_ADDENDUM = """
-[REFACTOR-MODUS · ONE-RUN VOLLCODE-OUTPUT]
-
-Kontextquellen (vom Host als JSON übergeben):
-- 'source_of_truth_code' (vollständiger, aktuell laufender Code).
-- 'plan_spec' (aktuelle Plan-Spezifikation, falls vorhanden).
-- 'components_manifest' (verwendete Komponenten/Hashes).
-- 'user_change_request' (Wunsch der Person).
-
-Dein Output verwendet GENAU dasselbe 4-Felder-Protokoll wie der Haupt-Agent:
-{
-  "user_markdown": "<sichtbar>",
-  "suggestions": ["<max 4>"],
-  "json": { "plan_spec": {...}, "components_manifest": [...] },
-  "code": "<VOLLSTÄNDIGER PYTHON CODE, OHNE FENCES>"
-}
-
-Regeln:
-- Kein Patch-Format. Gib IMMER Vollcode im Feld 'code', wenn Änderungen gewünscht/erforderlich sind.
-- Minimal-invasiv auf Logik-Ebene, aber Ergebnis ist eine konsistente, ausführbare Gesamtdatei.
-- Keine EE-Init/Auth im Code. Einziger Entry-Point def main(): ...
-- Nichts beim Import ausführen; Render ausschließlich in main().
-- Wenn noch Klärung nötig: nur 'user_markdown' + 'suggestions' ausgeben (ohne 'code').
-"""
-
-# ---------- Output-Schemas ----------
+# ---------- Output-Schema ----------
 class UiResponse(BaseModel):
     user_markdown: str = Field(description="Sichtbarer Text für den Chat. Kein Code-Fence.")
     suggestions: Optional[List[str]] = Field(default=None, description="Bis zu 4 Vorschläge (Buttons).")
@@ -547,27 +521,13 @@ try:
 except Exception:
     pass
 
-# ---------- Agent-Instanzen ----------
+# ---------- Single-Agent-Instanz (kein Refactor-Agent mehr) ----------
 APP_AGENT = None
-REFACTOR_AGENT = None
 
 if AGENTS_OK:
-    # Haupt-Agent
     APP_AGENT = Agent(
         name="EO-AppAgent",
         instructions=MEGA_PROMPT + "\n\n" + APP_AGENT_ADDENDUM,
-        tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python],
-        model=OpenAIResponsesModel(
-            model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
-            openai_client=openai_client
-        ),
-        output_type=AgentOutputSchema(UiResponse, strict_json_schema=False),
-    )
-
-    # Refactor-Agent (One-Run Vollcode-Output, gleiches Schema)
-    REFACTOR_AGENT = Agent(
-        name="EO-Refactor",
-        instructions=MEGA_PROMPT + "\n\n" + REFACTOR_ADDENDUM,
         tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python],
         model=OpenAIResponsesModel(
             model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
@@ -610,7 +570,6 @@ def preflight_and_switch(code_text: str) -> bool:
         st.session_state.last_code = sanitized
         st.session_state._runner_autorun_done = False
         st.session_state.build_completed = True
-        st.session_state.refactor_mode = True
         autorender_now()
         return True
     except Exception as e:
@@ -700,10 +659,10 @@ with st.sidebar:
     st.write("OPENAI_API_KEY gesetzt:", "✅" if os.environ.get("OPENAI_API_KEY") else "❌")
     st.write(f"Earth Engine: {'✅' if _EE_READY else '❌'}")
     st.divider()
-    st.caption("Antwortformat: Markdown + Suggestions + JSON (intern) + Code (unsichtbarer Preflight/Handoff).")
+    st.caption("Single-Agent-Modus: Markdown + Suggestions + JSON (intern) + Code (Sanitizer, kein Refactor-Agent).")
     st.divider()
 
-    # Ausführungsmodus (vereinfacht: ohne Fixer/Sanitizer)
+    # Ausführungsmodus
     mode_label = "Ausführungsmodus"
     options = ["Direkt ausführen", "Nur Preflight"]
     default_index = 0
@@ -733,8 +692,6 @@ if "_runner_autorun_done" not in st.session_state:
     st.session_state._runner_autorun_done = False
 if "last_json" not in st.session_state:
     st.session_state.last_json = None
-if "refactor_mode" not in st.session_state:
-    st.session_state.refactor_mode = False
 if "build_completed" not in st.session_state:
     st.session_state.build_completed = False
 if "current_suggestions" not in st.session_state:
@@ -772,6 +729,7 @@ if ui_only_rerun and prompt:
     st.session_state["skip_agent_on_next_run"] = False
     st.rerun()
 
+# ===== Single-Agent Routing ====================================================
 if prompt and not ui_only_rerun:
     # Vorschläge verwerfen (ephemer)
     st.session_state["current_suggestions"] = []
@@ -787,126 +745,65 @@ if prompt and not ui_only_rerun:
 
     ensure_event_loop()
 
-    # === Routing: vor/nach erstem Build ======================================
-    if not st.session_state.get("build_completed", False):
-        # ---- Haupt-Agent: 4 Felder ------------------------------------------
-        if APP_AGENT is None:
-            st.error("Haupt-Agent nicht initialisiert.")
-            st.stop()
+    # ---- Haupt-Agent: 4 Felder ----------------------------------------------
+    if APP_AGENT is None:
+        st.error("Haupt-Agent nicht initialisiert.")
+        st.stop()
 
-        res = Runner.run_sync(
-            APP_AGENT,
-            input=prompt,
-            session=sdk_session,
-            max_turns=60,
-        )
-        out = getattr(res, "final_output", None)
+    res = Runner.run_sync(
+        APP_AGENT,
+        input=prompt,
+        session=sdk_session,
+        max_turns=60,
+    )
+    out = getattr(res, "final_output", None)
 
-        user_md = ""
-        suggestions: Optional[List[str]] = None
-        json_obj: Optional[Dict[str, Any]] = None
-        code_text: Optional[str] = None
+    user_md = ""
+    suggestions: Optional[List[str]] = None
+    json_obj: Optional[Dict[str, Any]] = None
+    code_text: Optional[str] = None
 
-        if out and not isinstance(out, str):
-            user_md = getattr(out, "user_markdown", "") or ""
-            suggestions = getattr(out, "suggestions", None)
-            json_obj = getattr(out, "json", None)
-            code_text = getattr(out, "code", None)
+    if out and not isinstance(out, str):
+        user_md = getattr(out, "user_markdown", "") or ""
+        suggestions = getattr(out, "suggestions", None)
+        json_obj = getattr(out, "json", None)
+        code_text = getattr(out, "code", None)
 
-        # 1) user_markdown
-        if isinstance(user_md, str) and user_md.strip():
+    # 1) user_markdown
+    if isinstance(user_md, str) and user_md.strip():
+        with st.chat_message("assistant"):
+            st.markdown(user_md)
+        st.session_state.messages.append({"role": "assistant", "content": user_md})
+
+    # 2) suggestions → sofort ephemer anzeigen
+    if isinstance(suggestions, list) and suggestions:
+        st.session_state["current_suggestions"] = [s for s in suggestions if isinstance(s, str) and s.strip()][:4]
+        render_ephemeral_suggestions()
+
+    # 3) JSON → persistieren
+    if isinstance(json_obj, dict):
+        st.session_state["last_json"] = json_obj
+
+    # 4) code → Preflight/Handoff
+    handoff_done = False
+    attempted_build = False
+    ok = False
+
+    if isinstance(code_text, str) and code_text.strip():
+        attempted_build = True
+        ok = preflight_and_switch(code_text)
+
+    if attempted_build:
+        if ok:
+            handoff_done = True
+        else:
             with st.chat_message("assistant"):
-                st.markdown(user_md)
-            st.session_state.messages.append({"role": "assistant", "content": user_md})
+                st.markdown("Der Code konnte nicht ausgeführt werden (Auto-Sanitizer aktiv, kein Auto-Fix). Bitte Parameter anpassen oder erneut versuchen.")
 
-        # 2) suggestions → sofort ephemer anzeigen
-        if isinstance(suggestions, list) and suggestions:
-            st.session_state["current_suggestions"] = [s for s in suggestions if isinstance(s, str) and s.strip()][:4]
-            render_ephemeral_suggestions()
-
-        # 3) JSON → persistieren
-        if isinstance(json_obj, dict):
-            st.session_state["last_json"] = json_obj
-
-        # 4) code → Preflight/Handoff + Moduswechsel
-        handoff_done = False
-        attempted_build = False
-        ok = False
-
-        if isinstance(code_text, str) and code_text.strip():
-            attempted_build = True
-            ok = preflight_and_switch(code_text)
-
-        if attempted_build:
-            if ok:
-                handoff_done = True
-            else:
-                with st.chat_message("assistant"):
-                    st.markdown("Der Code konnte nicht ausgeführt werden (Auto-Sanitizer aktiv, kein Auto-Fix). Bitte Parameter anpassen oder erneut versuchen.")
-
-        if handoff_done:
-            st.session_state["skip_agent_on_next_run"] = True
-            st.rerun()
-
-    else:
-        # ---- Refactor-Agent (One-Run Vollcode) -------------------------------
-        if REFACTOR_AGENT is None:
-            st.error("Refactor-Agent nicht initialisiert.")
-            st.stop()
-
-        ctx_json = st.session_state.get("last_json") or {}
-        ctx_payload = {
-            "user_change_request": prompt,
-            "source_of_truth_code": st.session_state.last_code,
-            "plan_spec": (ctx_json.get("plan_spec") or ctx_json.get("planspec") or ctx_json.get("json")),
-            "components_manifest": ctx_json.get("components_manifest"),
-        }
-
-        ref_res = Runner.run_sync(
-            REFACTOR_AGENT,
-            input=json.dumps(ctx_payload, ensure_ascii=False),
-            session=sdk_session,
-            max_turns=60,
-        )
-        out = getattr(ref_res, "final_output", None)
-
-        user_md = ""
-        suggestions: Optional[List[str]] = None
-        json_obj: Optional[Dict[str, Any]] = None
-        code_text: Optional[str] = None
-
-        if out and not isinstance(out, str):
-            user_md = getattr(out, "user_markdown", "") or ""
-            suggestions = getattr(out, "suggestions", None)
-            json_obj = getattr(out, "json", None)
-            code_text = getattr(out, "code", None)
-
-        if isinstance(user_md, str) and user_md.strip():
-            with st.chat_message("assistant"):
-                st.markdown(user_md)
-            st.session_state.messages.append({"role": "assistant", "content": user_md})
-
-        if isinstance(suggestions, list) and suggestions:
-            st.session_state["current_suggestions"] = [s for s in suggestions if isinstance(s, str) and s.strip()][:4]
-            render_ephemeral_suggestions()
-
-        if isinstance(json_obj, dict):
-            st.session_state["last_json"] = json_obj
-
-        handoff_done = False
-        attempted_build = False
-        if isinstance(code_text, str) and code_text.strip():
-            attempted_build = True
-            ok = preflight_and_switch(code_text)
-            if ok:
-                handoff_done = True
-            else:
-                with st.chat_message("assistant"):
-                    st.markdown("Die Änderung führte zu Fehlern (Auto-Sanitizer aktiv, kein Auto-Fix). Bitte genauer spezifizieren oder Parameter anpassen.")
-
-        if handoff_done:
-            st.session_state["skip_agent_on_next_run"] = True
-            st.rerun()
+    if handoff_done:
+        # Nur UI-Rerun, keinen Agentenlauf forcieren
+        st.session_state["skip_agent_on_next_run"] = True
+        st.rerun()
 
 # ===== Auto-Re-Render nach Re-Run =============================================
 if st.session_state.get("last_code") and not st.session_state.get("_runner_autorun_done"):
