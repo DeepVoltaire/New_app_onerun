@@ -639,6 +639,17 @@ def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
     return ok_out, text_out
 
 
+# --- SANITIZER für typische Agent-Ausgaben (kein KI-Fix, nur mechanisch) -----
+_SANITIZE_IMPORT_RE = re.compile(r'^\s*from\s+blocks\.components\.[^\n]+\n', re.MULTILINE)
+def _sanitize_agent_code(code_text: str) -> str:
+    s = code_text or ""
+    # 1) Korrigiere future-Import
+    s = s.replace("from future import annotations", "from __future__ import annotations")
+    # 2) Korrigiere main-Guard
+    s = re.sub(r'if\s+name\s*==\s*[\'"]main[\'"]\s*:', 'if __name__ == "__main__":', s)
+    # 3) Entferne In-Repo-Imports, da Komponenten bereits inline gebundelt sind
+    s = _SANITIZE_IMPORT_RE.sub("", s)
+    return s
 
 
 def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str, List[str]]:
@@ -658,25 +669,36 @@ def self_heal_until_runs(code_text: str, max_rounds: int = 5) -> Tuple[bool, str
     return ok, current, logs
 
 def preflight_and_switch(code_text: str) -> bool:
-    ok, final_code, _heal = self_heal_until_runs(code_text, max_rounds=5)
+    # Modusgesteuert: Aus / Nur Preflight / Voll
+    mode = st.session_state.get("self_heal_mode", "full")  # "full" | "preflight" | "off"
+    sanitized = _sanitize_agent_code(code_text)
+
+    def _switch(final_code: str) -> bool:
+        st.session_state.last_code = final_code
+        st.session_state._runner_autorun_done = False
+        st.session_state.build_completed = True
+        st.session_state.refactor_mode = True
+        try:
+            autorender_now()
+            return True
+        except Exception:
+            return False
+
+    if mode == "off":
+        # Direkt übernehmen, keine Heilung
+        return _switch(sanitized)
+
+    if mode == "preflight":
+        ok, _out = _sh_sandbox_exec(sanitized)  # nur Testlauf (keine Reparatur)
+        if not ok:
+            return False
+        return _switch(sanitized)
+
+    # Default: full (Preflight + Fixer)
+    ok, final_code, _heal = self_heal_until_runs(sanitized, max_rounds=5)
     if not ok:
         return False
-
-    # neuen Code als SoT setzen
-    st.session_state.last_code = final_code
-    st.session_state._runner_autorun_done = False
-    st.session_state.build_completed = True
-    st.session_state.refactor_mode = True
-
-    # >>> sofort sichtbar im festen Platzhalter rendern
-    #    (stellt sicher, dass alte Mini-App überschrieben wird)
-    try:
-        autorender_now()
-    except Exception:
-        # Autorender-Fehler nicht fatal fürs Preflight-Ergebnis
-        return False
-
-    return True
+    return _switch(final_code)
 
 
 # ===== Session / SDK-Session ==================================================
@@ -742,6 +764,22 @@ with st.sidebar:
     st.write(f"Earth Engine: {'✅' if _EE_READY else '❌'}")
     st.divider()
     st.caption("Antwortformat: Markdown + Suggestions + JSON (intern) + Code (unsichtbarer Preflight).")
+    st.divider()
+    # >>> Self-Heal Umschalter
+    _mode_label_to_key = {
+        "Voll (Preflight+Fixer)": "full",
+        "Nur Preflight": "preflight",
+        "Aus": "off",
+    }
+    _current_mode = st.session_state.get("self_heal_mode", "full")
+    _mode_label_init = {v: k for k, v in _mode_label_to_key.items()}[_current_mode]
+    _mode_label = st.selectbox(
+        "Self-Heal-Modus",
+        ["Voll (Preflight+Fixer)", "Nur Preflight", "Aus"],
+        index=["Voll (Preflight+Fixer)", "Nur Preflight", "Aus"].index(_mode_label_init),
+        help="Steuert Preflight-Runner und automatischen Fixer."
+    )
+    st.session_state["self_heal_mode"] = _mode_label_to_key[_mode_label]
 
 # Zentraler Render-Platzhalter, in den die Mini-App *immer* gerendert wird
 if "render_slot" not in st.session_state:
@@ -768,6 +806,8 @@ if "last_suggestions" not in st.session_state:
     st.session_state.last_suggestions = None
 if "sdk_session" not in st.session_state:
     st.session_state.sdk_session = None
+if "self_heal_mode" not in st.session_state:
+    st.session_state.self_heal_mode = "full"
 
 # --- UI-only Rerun Handling (einmalige Entkopplung des Autorender-Reruns) ---
 ui_only_rerun = False
@@ -823,7 +863,7 @@ def render_persistent_suggestions() -> None:
 # Persistente Vorschläge immer anzeigen (falls vorhanden)
 render_persistent_suggestions()
 
-# Eingabe — FIX: chat_input IMMER rendern, queued hat nur Priorität
+# Eingabe — chat_input IMMER rendern, queued hat nur Priorität
 _new_input = st.chat_input("Nachricht eingeben…")
 _queued = st.session_state.get("queued_input")
 if _queued:
@@ -882,9 +922,10 @@ if prompt and not ui_only_rerun:
                 st.markdown(user_md)
             st.session_state.messages.append({"role": "assistant", "content": user_md})
 
-        # 2) suggestions → persistieren; Rendering läuft zentral
+        # 2) suggestions → persistieren + **sofort** rendern
         if isinstance(suggestions, list) and suggestions:
             st.session_state["last_suggestions"] = suggestions
+            render_persistent_suggestions()  # <-- sofortige Anzeige im selben Run
 
         # 3) JSON → nur persistieren (kann plan_spec, block_index, components_manifest enthalten)
         if isinstance(json_obj, dict):
@@ -903,9 +944,14 @@ if prompt and not ui_only_rerun:
             if ok:
                 handoff_done = True
             else:
+                mode = st.session_state.get("self_heal_mode", "full")
                 with st.chat_message("assistant"):
-                    st.markdown("Ich hatte gerade ein Problem mit dem Code – ich versuche, es automatisch zu reparieren.")
-        # Wenn kein Build versucht wurde (kein code_text), hier NICHTS anzeigen.
+                    if mode == "off":
+                        st.markdown("Code kam mit Fehlern — **Self-Heal ist deaktiviert**. Aktiviere Self-Heal oder prüfe den letzten Log.")
+                    elif mode == "preflight":
+                        st.markdown("Preflight hat Fehler gefunden — **keine automatische Reparatur aktiv**.")
+                    else:
+                        st.markdown("Ich hatte gerade ein Problem mit dem Code – ich versuche, es automatisch zu reparieren.")
 
         if handoff_done:
             st.session_state["skip_agent_on_next_run"] = True
@@ -950,9 +996,10 @@ if prompt and not ui_only_rerun:
                 st.markdown(user_md)
             st.session_state.messages.append({"role": "assistant", "content": user_md})
 
-        # Vorschläge → persistieren; Rendering läuft zentral
+        # Vorschläge → persistieren + **sofort** rendern
         if isinstance(suggestions, list) and suggestions:
             st.session_state["last_suggestions"] = suggestions
+            render_persistent_suggestions()  # <-- sofortige Anzeige im selben Run
 
         # Patches anwenden → Preflight → Autorender
         handoff_done = False
@@ -977,8 +1024,14 @@ if prompt and not ui_only_rerun:
                                 st.session_state["last_json"]["block_index"] = new_block_index
                         handoff_done = True
                     else:
+                        mode = st.session_state.get("self_heal_mode", "full")
                         with st.chat_message("assistant"):
-                            st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
+                            if mode == "off":
+                                st.markdown("Patch führte zu Fehlern — **Self-Heal ist deaktiviert**.")
+                            elif mode == "preflight":
+                                st.markdown("Preflight fand Fehler im Patch — **keine Reparatur aktiv**.")
+                            else:
+                                st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
                 else:
                     # 3) Pfad B (Fallback): Wenn keine Marker AND genau 1 Patch und der liefert vollen Code → direkt übernehmen
                     if len(patches_dicts) == 1 and _looks_like_full_program(patches_dicts[0]["new_code"]):
@@ -987,8 +1040,14 @@ if prompt and not ui_only_rerun:
                         if ok:
                             handoff_done = True
                         else:
+                            mode = st.session_state.get("self_heal_mode", "full")
                             with st.chat_message("assistant"):
-                                st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
+                                if mode == "off":
+                                    st.markdown("Vollcode-Patch hat Fehler — **Self-Heal ist deaktiviert**.")
+                                elif mode == "preflight":
+                                    st.markdown("Preflight fand Fehler — **keine Reparatur aktiv**.")
+                                else:
+                                    st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
                     else:
                         raise RuntimeError("Keine Block-Marker gefunden und Patch ist kein Vollcode – kann nicht anwenden.")
             except Exception as e:
