@@ -783,7 +783,24 @@ for m in st.session_state.messages:
         st.markdown(m["content"])
 
 def render_suggestions(suggestions: Optional[List[str]]) -> Optional[str]:
-    return None  # ersetzt durch persistenten Renderer
+    if not suggestions:
+        return None
+    s = [x for x in suggestions if isinstance(x, str) and x.strip()][:4]
+    if not s:
+        return None
+
+    selected: Optional[str] = None
+    with st.chat_message("assistant"):
+        st.subheader("Vorschläge")
+        cols = st.columns(2)
+        for i, label in enumerate(s):
+            with cols[i % 2]:
+                with st.container(border=True):
+                    st.markdown(label)
+                    if st.button("Auswählen", key=f"sugg_{i}", use_container_width=True):
+                        selected = label
+    return selected
+
 
 def render_persistent_suggestions() -> None:
     """Zeigt ggf. zuletzt empfangene Vorschläge (persistiert) und setzt bei Klick queued_input."""
@@ -872,15 +889,21 @@ if prompt and not ui_only_rerun:
 
         # 4) code → Preflight/Fixer/Autorender + Moduswechsel
         handoff_done = False
+        attempted_build = False
         ok = False
+        
         if isinstance(code_text, str) and code_text.strip():
+            attempted_build = True
             ok = preflight_and_switch(code_text)
         
-        if ok:
-            handoff_done = True
-        else:
-            with st.chat_message("assistant"):
-                st.markdown("Ich behebe Laufzeitfehler intern und starte automatisch neu, sobald stabil.")
+        if attempted_build:
+            if ok:
+                handoff_done = True
+            else:
+                with st.chat_message("assistant"):
+                    st.markdown("Ich hatte gerade ein Problem mit dem Code – ich versuche, es automatisch zu reparieren.")
+        # Wenn kein Build versucht wurde (kein code_text), hier NICHTS anzeigen.
+
 
         if handoff_done:
             st.session_state["skip_agent_on_next_run"] = True
@@ -1001,3 +1024,4 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
         st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
+
