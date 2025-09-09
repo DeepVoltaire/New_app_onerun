@@ -70,6 +70,43 @@ def ensure_event_loop() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
+
+# ===== Patch-/Marker-Helpers ===================================================
+def _normalize_patches_list(patches_in) -> List[Dict[str, Any]]:
+    """Akzeptiert Pydantic-Objekte (PatchItem) ODER dicts und liefert List[dict]."""
+    out: List[Dict[str, Any]] = []
+    for p in patches_in or []:
+        if isinstance(p, dict):
+            out.append(p)
+        else:
+            out.append({
+                "block_id": getattr(p, "block_id", None),
+                "new_code": getattr(p, "new_code", None),
+                "old_hash": getattr(p, "old_hash", None),
+                "notes": getattr(p, "notes", None),
+            })
+    # nur valide Einträge
+    return [d for d in out if d.get("block_id") and isinstance(d.get("new_code"), str)]
+
+_REGION_RE = re.compile(r"^\s*#\s*region\s+BLOCK\s+id\s*=", re.MULTILINE)
+def _has_region_markers(code_text: str) -> bool:
+    return bool(_REGION_RE.search(code_text or ""))
+
+def _looks_like_full_program(snippet: str) -> bool:
+    """Ein Patch kann fälschlich Vollcode enthalten -> heuristisch erkennen."""
+    if not isinstance(snippet, str):
+        return False
+    s = snippet.strip()
+    # typische Artefakte für Vollcode
+    return (
+        s.startswith("from __future__ import annotations")
+        or s.startswith("import ")
+        or "def main(" in s
+        or "# ==== BUNDLED COMPONENTS BEGIN ====" in s
+    )
+
+
+
 # ===== Earth Engine (Host-Init) ===============================================
 EE_OK = True
 try:
@@ -605,11 +642,23 @@ def preflight_and_switch(code_text: str) -> bool:
     ok, final_code, _heal = self_heal_until_runs(code_text, max_rounds=5)
     if not ok:
         return False
+
+    # neuen Code als SoT setzen
     st.session_state.last_code = final_code
     st.session_state._runner_autorun_done = False
     st.session_state.build_completed = True
     st.session_state.refactor_mode = True
+
+    # >>> sofort sichtbar im festen Platzhalter rendern
+    #    (stellt sicher, dass alte Mini-App überschrieben wird)
+    try:
+        autorender_now()
+    except Exception:
+        # Autorender-Fehler nicht fatal fürs Preflight-Ergebnis
+        return False
+
     return True
+
 
 # ===== Session / SDK-Session ==================================================
 if AGENTS_OK:
@@ -627,31 +676,35 @@ else:
 
 
 def autorender_now() -> None:
-    """Führt den aktuellen last_code sofort im sichtbaren Streamlit-Run aus."""
-    try:
-        import ee  # falls oben im Scope
-    except Exception:
-        ee = None  # noqa: F401
-    ns: Dict[str, object] = {"__name__": "__generated__", "st": st}
-    if ee is not None:
-        ns["ee"] = ee
-    compiled = compile(st.session_state.last_code, "<autorender-now>", "exec")
-    exec(compiled, ns, ns)
+    """Führt den aktuellen last_code *im render_slot* aus (ersetzt alte Anzeige)."""
+    slot = st.session_state.render_slot
+    slot.empty()  # alte Mini-App entfernen
+    with slot.container():
+        try:
+            import ee  # falls oben im Scope
+        except Exception:
+            ee = None  # noqa: F401
+        ns: Dict[str, object] = {"__name__": "__generated__", "st": st}
+        if ee is not None:
+            ns["ee"] = ee
+        compiled = compile(st.session_state.last_code, "<autorender-now>", "exec")
+        exec(compiled, ns, ns)
 
-    entry = None
-    for fn_name in ("t2e_app", "render", "main"):
-        fn = ns.get(fn_name)
-        if callable(fn):
-            entry = fn
-            break
-    if entry is None:
-        raise RuntimeError("Autorender-now: Kein Entry-Point (t2e_app/render/main) gefunden.")
-    try:
-        entry()
-    except TypeError:
-        entry(st)
+        entry = None
+        for fn_name in ("t2e_app", "render", "main"):
+            fn = ns.get(fn_name)
+            if callable(fn):
+                entry = fn
+                break
+        if entry is None:
+            raise RuntimeError("Autorender-now: Kein Entry-Point (t2e_app/render/main) gefunden.")
+        try:
+            entry()
+        except TypeError:
+            entry(st)
 
     st.session_state._runner_autorun_done = True
+
 
 
 
@@ -666,6 +719,10 @@ with st.sidebar:
     st.write(f"Earth Engine: {'✅' if _EE_READY else '❌'}")
     st.divider()
     st.caption("Antwortformat: Markdown + Suggestions + JSON (intern) + Code (unsichtbarer Preflight).")
+
+# Zentraler Render-Platzhalter, in den die Mini-App *immer* gerendert wird
+if "render_slot" not in st.session_state:
+    st.session_state.render_slot = st.empty()
 
 # Session-States
 if "messages" not in st.session_state:
@@ -781,14 +838,13 @@ if prompt and not ui_only_rerun:
         # 4) code → Preflight/Fixer/Autorender + Moduswechsel
         handoff_done = False
         if isinstance(code_text, str) and code_text.strip():
-            ok = preflight_and_switch(code_text)
-            if ok:
-                # NEU: sofort rendern, damit die Mini-App unmittelbar sichtbar wird
-                autorender_now()
-                handoff_done = True
-            else:
-                with st.chat_message("assistant"):
-                    st.markdown("Ich behebe Laufzeitfehler intern und starte automatisch neu, sobald stabil.")
+        ok = preflight_and_switch(code_text)
+        if ok:
+            handoff_done = True
+        else:
+            with st.chat_message("assistant"):
+                st.markdown("Ich behebe Laufzeitfehler intern und starte automatisch neu, sobald stabil.")
+
 
 
         if handoff_done:
@@ -842,31 +898,48 @@ if prompt and not ui_only_rerun:
             st.rerun()
 
         # Patches anwenden → Preflight → Autorender
+        # Patches anwenden → Preflight → Autorender
         handoff_done = False
         if patches:
+            # 1) Patch-Objekte → dicts
+            patches_dicts = _normalize_patches_list(patches)
+        
+            # 2) Pfad A: Marker-basiertes Patchen (empfohlen)
+            try_marker = _has_region_markers(st.session_state.last_code)
+        
             try:
-                patched = apply_patches(st.session_state.last_code, patches, strategy="body_only")
-                ok = preflight_and_switch(patched)
-                if ok:
-                    # NEU: sofort rendern, damit die Aktualisierung direkt sichtbar ist
-                    autorender_now()
-        
-                    # OPTIONAL: falls der Refactor-Agent künftig neue Index/Plan-Daten mitschickt
-                    # (hier nur gesetzt, wenn vorhanden – keine Anzeige!)
-                    if isinstance(patches_out, dict):
-                        new_block_index = patches_out.get("block_index")
-                        if new_block_index:
-                            if not st.session_state.get("last_json"):
-                                st.session_state["last_json"] = {}
-                            st.session_state["last_json"]["block_index"] = new_block_index
-        
-                    handoff_done = True
+                if try_marker:
+                    patched = apply_patches(st.session_state.last_code, patches_dicts, strategy="body_only")
+                    ok = preflight_and_switch(patched)
+                    if ok:
+                        
+                        # OPTIONAL: zukünftige Zusatzdaten übernehmen
+                        if isinstance(patches_out, dict):
+                            new_block_index = patches_out.get("block_index")
+                            if new_block_index:
+                                if not st.session_state.get("last_json"):
+                                    st.session_state["last_json"] = {}
+                                st.session_state["last_json"]["block_index"] = new_block_index
+                        handoff_done = True
+                    else:
+                        with st.chat_message("assistant"):
+                            st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
                 else:
-                    with st.chat_message("assistant"):
-                        st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
+                    # 3) Pfad B (Fallback): Wenn keine Marker AND genau 1 Patch und der liefert vollen Code → direkt übernehmen
+                    if len(patches_dicts) == 1 and _looks_like_full_program(patches_dicts[0]["new_code"]):
+                        full_code = patches_dicts[0]["new_code"]
+                        ok = preflight_and_switch(full_code)
+                        if ok:
+                            handoff_done = True
+                        else:
+                            with st.chat_message("assistant"):
+                                st.markdown("Die Änderung führte zu Laufzeitfehlern — ich korrigiere das intern und starte neu, sobald stabil.")
+                    else:
+                        raise RuntimeError("Keine Block-Marker gefunden und Patch ist kein Vollcode – kann nicht anwenden.")
             except Exception as e:
                 with st.chat_message("assistant"):
                     st.markdown(f"Patch-Anwendung fehlgeschlagen: {e!r}. Bitte Wünsche etwas konkreter formulieren.")
+
 
 
         if handoff_done:
@@ -874,30 +947,35 @@ if prompt and not ui_only_rerun:
             st.rerun()
 
 # ===== Auto-Re-Render nach Re-Run =============================================
-if st.session_state.get("last_code"):
+# ===== Auto-Re-Render nach Re-Run =============================================
+if st.session_state.get("last_code") and not st.session_state.get("_runner_autorun_done"):
     try:
-        ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
-        compiled = compile(st.session_state.last_code, "<autorender>", "exec")
-        exec(compiled, ns, ns)
+        slot = st.session_state.render_slot
+        slot.empty()
+        with slot.container():
+            ns: Dict[str, object] = {"__name__": "__generated__", "st": st, "ee": ee}
+            compiled = compile(st.session_state.last_code, "<autorender>", "exec")
+            exec(compiled, ns, ns)
 
-        entry = None
-        for fn_name in ("t2e_app", "render", "main"):
-            fn = ns.get(fn_name)
-            if callable(fn):
-                entry = fn
-                break
-        if entry is None:
-            raise RuntimeError("Auto-Render: Kein Entry-Point gefunden (t2e_app/render/main).")
-        try:
-            entry()
-        except TypeError:
-            entry(st)
+            entry = None
+            for fn_name in ("t2e_app", "render", "main"):
+                fn = ns.get(fn_name)
+                if callable(fn):
+                    entry = fn
+                    break
+            if entry is None:
+                raise RuntimeError("Auto-Render: Kein Entry-Point gefunden (t2e_app/render/main).")
+            try:
+                entry()
+            except TypeError:
+                entry(st)
 
-        if not st.session_state._runner_autorun_done:
-            st.session_state._runner_autorun_done = True
-            st.sidebar.caption("Runner automatisch gestartet.")
+        st.session_state._runner_autorun_done = True
+        st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
+
+
 
 
 
