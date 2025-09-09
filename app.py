@@ -756,10 +756,40 @@ def _sh_get_fixer_agent():
     return fixer_agent
 
 def _sh_fix_code_once(code_text: str, error_log: str) -> Optional[str]:
+    """Lässt den Fixer laufen und gibt IMMER entweder reinen Code (str) oder None zurück."""
+    def _norm_code(obj: Any) -> Optional[str]:
+        # 1) Direkter String
+        if isinstance(obj, str):
+            s = obj.strip()
+            return s if s else None
+        # 2) Pydantic-Objekt mit .code
+        if hasattr(obj, "code") and isinstance(getattr(obj, "code"), str):
+            s = getattr(obj, "code").strip()
+            return s if s else None
+        # 3) Pydantic-Objekt → dict
+        if hasattr(obj, "model_dump"):
+            try:
+                d = obj.model_dump()
+                return _norm_code(d)
+            except Exception:
+                pass
+        # 4) dict mit "code"
+        if isinstance(obj, dict):
+            v = obj.get("code")
+            return _norm_code(v)
+        # 5) Sequenzen (z. B. Tuple aus (output, usage) etc.)
+        if isinstance(obj, (list, tuple)):
+            for item in obj:
+                s = _norm_code(item)
+                if s:
+                    return s
+        return None
+
     ensure_event_loop()
     fixer_agent = _sh_get_fixer_agent()
     if fixer_agent is None:
         return None
+
     user_payload = (
         "Repariere den folgenden Python-Code auf Basis dieses Fehlerlogs.\n"
         "Gib NUR den vollständigen, korrigierten Code zurück.\n\n"
@@ -776,14 +806,17 @@ def _sh_fix_code_once(code_text: str, error_log: str) -> Optional[str]:
             session=sdk_session,  # persistente Session auch für Fixer
             max_turns=DEFAULT_MAX_TURNS,
         )
+        # final_output kann je nach SDK-Path str, Pydantic, dict oder Tuple sein
         out = getattr(res, "final_output", None)
-        if hasattr(out, "code") and isinstance(out.code, str) and out.code.strip():
-            return out.code
-        if isinstance(out, str) and out.strip():
-            return out
-        return None
+        s = _norm_code(out)
+        if s:
+            return s
+        # Fallback: evtl. liefert run_sync selbst ein Tuple zurück
+        s = _norm_code(res)
+        return s
     except Exception:
         return None
+
 
 def _sh_sandbox_exec(code_text: str) -> Tuple[bool, str]:
     buf = _sh_io.StringIO()
@@ -1108,4 +1141,5 @@ if (('skip_agent_on_next_run' in st.session_state and not st.session_state['skip
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
 
 # Keine Runner-Buttons/Codeanzeige – vollautomatischer Ablauf
+
 
