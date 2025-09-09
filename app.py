@@ -674,6 +674,7 @@ def preflight_and_switch(code_text: str) -> bool:
     sanitized = _sanitize_agent_code(code_text)
 
     def _switch(final_code: str) -> bool:
+        final_code = _sanitize_agent_code(final_code) 
         st.session_state.last_code = final_code
         st.session_state._runner_autorun_done = False
         st.session_state.build_completed = True
@@ -1085,3 +1086,4 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
         st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
+
