@@ -341,19 +341,92 @@ def _tool_run_python_impl(code: str,
 
 tool_run_python = function_tool(_tool_run_python_impl)
 
-# ===== Structured Output – Haupt-Agent (4 Felder) =============================
+# ---------- Addendum: Haupt-Agent (4-Felder-Protokoll) ----------
+APP_AGENT_ADDENDUM = """
+[OUTPUT PROTOKOLL — HAUPT-AGENT · STRICT]
+
+Du gibst deinen Output IMMER als strukturiertes Objekt mit bis zu vier Feldern zurück:
+
+1) user_markdown (string)
+   - Sichtbarer, natürlicher Text für die Person.
+   - Keine Code-Fences, kein JSON, keine Marker.
+   - Kurz und menschlich: Orientierung, Rückfragen oder Bestätigung.
+   - Wenn alles klar ist (Stop-Kriterien erfüllt), ein kurzer Satz: „Ich baue dir …“
+
+2) suggestions (array of string, max 4)
+   - Bis zu vier ergänzende, klickbare Vorschläge.
+   - Kurz, handlungsorientiert, konsistent mit user_markdown.
+   - Beispiele: „Nimm Juli 2023“, „Erweitere Umkreis auf 20 km“, „Zeige Vergleich links/rechts“.
+
+3) json (object)
+   - Nur intern, niemals anzeigen.
+   - Container für strukturierte Daten wie:
+     - plan_spec (gemäß Abschnitt 15.2)
+     - block_index (Liste der Code-Blöcke mit Metadaten)
+     - components_manifest (Liste der verwendeten Komponenten inkl. Hash/Bytes)
+     - policy_notes (interne Korrekturen/Begründungen)
+   - Strikt valides JSON. Keine Kommentare, keine Erklärsätze.
+
+4) code (string)
+   - Vollständiger, lauffähiger Python-Quelltext, ohne Markdown-Fences.
+   - Alle ausführbaren Teile liegen in markierten Regionen:
+     # region BLOCK id=... kind=... phase=... name="..." plan_ref="..." hash=... modifiable=<yes|no>
+     ... Body ...
+     # endregion BLOCK id=...
+   - Ein einziger Entry-Point (def main(): …), keine EE-Init/Auth im Code.
+   - UI optional, GEE-first, Render nur in main(), nichts beim Import.
+   - Nur ausgeben, wenn die Stop-Kriterien erfüllt sind (siehe Abschnitt 12).
+
+SICHTBARKEIT:
+- user_markdown und suggestions → sichtbar.
+- json und code → niemals direkt im Chat anzeigen.
+
+PLAN_SPEC:
+- Falls Richtung/Parameter klar (Stop-Kriterien erfüllt): lege PLAN_SPEC streng nach Abschnitt 15.2 in json.plan_spec ab.
+- Fehlen Pflichtangaben: stelle Rückfragen in user_markdown und gib KEIN json.plan_spec aus.
+- Niemals PLAN_SPEC als Text ausgeben.
+"""
+
+# ---------- Addendum: Refactor-Agent (Patch-Only) ----------
+REFACTOR_ADDENDUM = """
+[REFACTOR-MODUS · PATCH-ONLY]
+
+Kontextquellen (vom Host übergeben):
+- CURRENT_CODE (vollständiger, aktuell laufender Code mit Block-Markern).
+- json.block_index (Struktur und Metadaten der vorhandenen Blöcke).
+- json.plan_spec (Plan-Spezifikation des aktuellen Builds).
+- json.components_manifest (verwendete Komponenten/Hashes).
+
+Dein Output ist strikt ein strukturiertes Objekt:
+{
+  "user_markdown": "<optional sichtbarer Text>",
+  "suggestions": ["<max 4 kurze Vorschläge>"],
+  "patches": [
+    { "block_id": "<id>", "new_code": "<GANZER Body ohne Marker>", "old_hash": "<optional>", "notes": "<optional>" }
+  ]
+}
+
+Regeln:
+- Nur Block-BODIES patchen, keine Marker mitsenden.
+- Minimal-invasiv: nur angefragte Blöcke oder solche mit modifiable=yes ändern.
+- Öffentliche Signaturen erhalten, keine neuen Abhängigkeiten, keine EE-Init/Auth.
+- Keine neuen Blöcke anlegen, außer die Person bestätigt dies explizit.
+- Wenn eine Änderung neue Blöcke erfordert: zuerst um Zustimmung bitten (in user_markdown), dann Patch liefern.
+- Niemals Vollcode ausgeben. Keine JSON/Code-Fences im sichtbaren Text.
+"""
+
+# ---------- Output-Schemas ----------
 class UiResponse(BaseModel):
     user_markdown: str = Field(description="Sichtbarer Text für den Chat. Kein Code-Fence.")
     suggestions: Optional[List[str]] = Field(default=None, description="Bis zu 4 Vorschläge (Buttons).")
-    json: Optional[Dict[str, Any]] = Field(default=None, description="Interner JSON-Block (z. B. plan_spec, block_index). Niemals anzeigen.")
-    code: Optional[str] = Field(default=None, description="Vollständiger Python-Code (ohne Markdown-Fence).")
+    json: Optional[Dict[str, Any]] = Field(default=None, description="Interner JSON-Block (z. B. plan_spec, block_index, components_manifest). Niemals anzeigen.")
+    code: Optional[str] = Field(default=None, description="Vollständiger Python-Code (ohne Markdown-Fences).")
 
 try:
     UiResponse.model_rebuild()
 except Exception:
     pass
 
-# ===== Refactor-Output – Agent 2 (Patches only) ===============================
 class PatchItem(BaseModel):
     block_id: str
     new_code: str
@@ -370,26 +443,34 @@ try:
 except Exception:
     pass
 
-# ===== Agenten-Instanzen ======================================================
-APP_AGENT: Optional[Agent] = None
-REFACTOR_AGENT: Optional[Agent] = None
+# ---------- Agent-Instanzen ----------
+APP_AGENT = None
+REFACTOR_AGENT = None
 
 if AGENTS_OK:
+    # Haupt-Agent: Mega-Prompt + 4-Felder-Addendum
     APP_AGENT = Agent(
         name="EO-AppAgent",
-        instructions=MEGA_PROMPT,  # später leicht anpassen für 4-Felder-Protokoll
+        instructions=MEGA_PROMPT + "\n\n" + APP_AGENT_ADDENDUM,
         tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components, tool_run_python],
-        model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
+        model=OpenAIResponsesModel(
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
+            openai_client=openai_client
+        ),
         output_type=AgentOutputSchema(UiResponse, strict_json_schema=False),
     )
+
+    # Refactor-Agent: Mega-Prompt + Patch-Only-Addendum
     REFACTOR_AGENT = Agent(
         name="EO-Refactor",
-        instructions=MEGA_PROMPT + "\n\n" + "ROLE: Refactor Agent. Return only JSON patches per schema. No full files. User sees no code.",
+        instructions=MEGA_PROMPT + "\n\n" + REFACTOR_ADDENDUM,
         tools=[tool_get_meta, tool_get_policy, tool_get_uc_sections, tool_bundle_components],
-        model=OpenAIResponsesModel(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), openai_client=openai_client),
+        model=OpenAIResponsesModel(
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
+            openai_client=openai_client
+        ),
         output_type=AgentOutputSchema(RefactorResponse, strict_json_schema=True),
     )
-
 # ===== Self-Heal / Fixer (separat, nur intern) ================================
 import sys as _sh_sys
 import io as _sh_io
@@ -762,3 +843,4 @@ if st.session_state.get("last_code"):
             st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
+
