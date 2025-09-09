@@ -671,10 +671,14 @@ if AGENTS_OK:
     try:
         if "agent_session_id" not in st.session_state:
             st.session_state.agent_session_id = uuid.uuid4().hex
-        SESSIONS_DB = str((RUNNER_DIR / "sessions.db").resolve())
-        sdk_session = SQLiteSession(st.session_state.agent_session_id, SESSIONS_DB)
+        if "sdk_session" not in st.session_state:
+            SESSIONS_DB = str((RUNNER_DIR / "sessions.db").resolve())
+            st.session_state.sdk_session = SQLiteSession(st.session_state.agent_session_id, SESSIONS_DB)
     except Exception:
-        sdk_session = SQLiteSession(st.session_state.agent_session_id)  # in-memory fallback
+        # Fallback *persistiert* ebenfalls im Session State (verhindert Neuaufbau pro Run)
+        if "sdk_session" not in st.session_state:
+            st.session_state.sdk_session = SQLiteSession(st.session_state.agent_session_id)  # in-memory fallback
+    sdk_session = st.session_state.sdk_session
 else:
     sdk_session = None  # type: ignore
 
@@ -747,6 +751,10 @@ if "refactor_mode" not in st.session_state:
     st.session_state.refactor_mode = False
 if "build_completed" not in st.session_state:
     st.session_state.build_completed = False
+if "last_suggestions" not in st.session_state:
+    st.session_state.last_suggestions = None
+if "sdk_session" not in st.session_state:
+    st.session_state.sdk_session = None
 
 # --- UI-only Rerun Handling (einmalige Entkopplung des Autorender-Reruns) ---
 ui_only_rerun = False
@@ -763,20 +771,26 @@ for m in st.session_state.messages:
         st.markdown(m["content"])
 
 def render_suggestions(suggestions: Optional[List[str]]) -> Optional[str]:
-    if not suggestions:
-        return None
-    s = [s for s in suggestions if isinstance(s, str) and s.strip()][:4]
-    if not s:
-        return None
+    return None  # ersetzt durch persistenten Renderer
+
+def render_persistent_suggestions() -> None:
+    """Zeigt ggf. zuletzt empfangene Vorschläge (persistiert) und setzt bei Klick queued_input."""
+    sugg = st.session_state.get("last_suggestions") or []
+    if not isinstance(sugg, list) or not sugg:
+        return
+
     st.subheader("Vorschläge")
     cols = st.columns(2)
-    for i, label in enumerate(s):
+    for i, label in enumerate(sugg[:4]):
         with cols[i % 2]:
-            with st.container(border=True):
-                st.markdown(label)
-                if st.button("Auswählen", key=f"sugg_{i}", use_container_width=True):
-                    return label
-    return None
+            if st.button(label, key=f"sugg_btn_{i}", use_container_width=True):
+                st.session_state["queued_input"] = label
+                st.session_state["last_suggestions"] = None
+                st.session_state["skip_agent_on_next_run"] = False
+                st.rerun()
+
+# Persistente Vorschläge immer anzeigen (falls vorhanden)
+render_persistent_suggestions()
 
 # Eingabe
 queued = st.session_state.get("queued_input")
@@ -785,6 +799,12 @@ if queued:
     prompt = queued
 else:
     prompt = st.chat_input("Nachricht eingeben…")
+
+# Verliere keine Eingabe im UI-only Rerun: Puffer + sofort rerun
+if ui_only_rerun and prompt:
+    st.session_state["queued_input"] = prompt
+    st.session_state["skip_agent_on_next_run"] = False
+    st.rerun()
 
 if prompt and not ui_only_rerun:
     # User Nachricht
@@ -830,12 +850,9 @@ if prompt and not ui_only_rerun:
                 st.markdown(user_md)
             st.session_state.messages.append({"role": "assistant", "content": user_md})
 
-        # 2) suggestions
-        selected = render_suggestions(suggestions)
-        if selected:
-            st.session_state["queued_input"] = selected
-            st.session_state["skip_agent_on_next_run"] = False
-            st.rerun()
+        # 2) suggestions → persistieren; Rendering läuft zentral
+        if isinstance(suggestions, list) and suggestions:
+            st.session_state["last_suggestions"] = suggestions
 
         # 3) JSON → nur persistieren (kann plan_spec, block_index, components_manifest enthalten)
         if isinstance(json_obj, dict):
@@ -852,9 +869,6 @@ if prompt and not ui_only_rerun:
         else:
             with st.chat_message("assistant"):
                 st.markdown("Ich behebe Laufzeitfehler intern und starte automatisch neu, sobald stabil.")
-
-
-
 
         if handoff_done:
             st.session_state["skip_agent_on_next_run"] = True
@@ -899,12 +913,9 @@ if prompt and not ui_only_rerun:
                 st.markdown(user_md)
             st.session_state.messages.append({"role": "assistant", "content": user_md})
 
-        # Vorschläge
-        selected = render_suggestions(suggestions)
-        if selected:
-            st.session_state["queued_input"] = selected
-            st.session_state["skip_agent_on_next_run"] = False
-            st.rerun()
+        # Vorschläge → persistieren; Rendering läuft zentral
+        if isinstance(suggestions, list) and suggestions:
+            st.session_state["last_suggestions"] = suggestions
 
         # Patches anwenden → Preflight → Autorender
         # Patches anwenden → Preflight → Autorender
@@ -949,8 +960,6 @@ if prompt and not ui_only_rerun:
                 with st.chat_message("assistant"):
                     st.markdown(f"Patch-Anwendung fehlgeschlagen: {e!r}. Bitte Wünsche etwas konkreter formulieren.")
 
-
-
         if handoff_done:
             st.session_state["skip_agent_on_next_run"] = True
             st.rerun()
@@ -983,10 +992,3 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
         st.sidebar.caption("Runner automatisch gestartet.")
     except BaseException:
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
-
-
-
-
-
-
-
