@@ -54,18 +54,24 @@ def render_split_map_right(
     """Render split map; do not hardcode palettes/min/max; use vis_params."""
     # Split-Map (rechte Seite)
     try:
+        # Basemap-Layer-Objekt statt String:
+        from geemap.foliumap import basemaps
+        left = getattr(basemaps, "OpenStreetMap", None)
+        if left is None:
+            raise RuntimeError("Basemap not available")
         m.split_map(
-            left_layer="OpenStreetMap",   # valid basemap; versionssicher
-            right_layer=right_layer,
+            left_layer=left,           # echtes Tile-Layer-Objekt
+            right_layer=right_layer,   # ee.Image oder Tile-Layer
             right_vis=vis_params,
             right_name=title,
         )
     except Exception:
-        # Fallback: normales Layer (kompatibel mit add_layer oder addLayer)
+        # Fallback: normales Layer
         fn = getattr(m, "add_layer", None) or getattr(m, "addLayer", None)
         if fn is None:
             raise RuntimeError("Map-Objekt unterstützt weder add_layer noch addLayer.")
         fn(right_layer, vis_params, title)
+
 
     # Optionale Farbleiste, nur wenn Min/Max/Palette vorhanden
     try:
