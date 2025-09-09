@@ -418,6 +418,46 @@ try:
 except Exception:
     pass
 
+# ====== Sanitizer (identische Fixes wie in der komplexen app.py) ==============
+# falscher main-Guard (alle Quotes zulassen)
+_SANITIZE_SIMPLE_RULES: Tuple[Tuple[str, str], ...] = (
+    (r"\bif\s+name\s*==\s*[\"']main[\"']\s*:", 'if __name__ == "__main__":'),
+)
+
+# Entferne jegliche st.set_page_config(...) Zeilen aus Agenten-Code
+_SET_PAGE_CONFIG_RE = re.compile(r"(?m)^\s*st\.set_page_config\s*\(.*?\)\s*$")
+
+def _ensure_future_annotations_first(text: str) -> str:
+    """
+    Entfernt alle Varianten von 'from future import annotations' / 'from __future__ import annotations'
+    aus dem Text und setzt genau eine korrekte Zeile GANZ nach oben.
+    """
+    text_wo = re.sub(
+        r"(?m)^\s*from\s+(__)?future\s+import\s+annotations\s*$",
+        "",
+        text,
+    ).lstrip("\n")
+    return "from __future__ import annotations\n\n" + text_wo
+
+def sanitize_code(code_text: Any) -> str:
+    """Minimale, aber robuste Sanitisierung für Agent/Vollcode-Ausgaben."""
+    s = code_text if isinstance(code_text, str) else str(code_text)
+
+    # 1) main-Guard normalisieren
+    for pat, repl in _SANITIZE_SIMPLE_RULES:
+        try:
+            s = re.sub(pat, repl, s)
+        except re.error:
+            pass
+
+    # 2) Future-Import an Dateibeginn sicherstellen
+    s = _ensure_future_annotations_first(s)
+
+    # 3) Doppeltes Page-Config verhindern
+    s = _SET_PAGE_CONFIG_RE.sub("", s)
+
+    return s
+
 # ---------- Agent-Instanzen ----------
 APP_AGENT = None
 REFACTOR_AGENT = None
@@ -447,18 +487,19 @@ if AGENTS_OK:
         output_type=AgentOutputSchema(UiResponse, strict_json_schema=False),
     )
 
-# ===== Preflight/Handoff (ohne Sanitizer & ohne Fixer) ========================
+# ===== Preflight/Handoff (mit Sanitizer) ======================================
 def preflight_and_switch(code_text: str) -> bool:
     """
-    Nimmt den Agenten-Vollcode unverändert entgegen.
-    Optionaler Preflight (py_compile-Äquivalent via compile()), danach Handoff in Autorender.
-    Kein automatisches Heilen, keine Sanitizer.
+    Nimmt den Agenten-Vollcode entgegen, sanitizt ihn (Future-Import, st.set_page_config entfernen,
+    Main-Guard fixen) und rendert dann.
     """
     mode = st.session_state.get("self_heal_mode", "Direkt ausführen")
 
+    sanitized = sanitize_code(code_text)
+
     if mode == "Nur Preflight":
         try:
-            compile(code_text, "<preflight>", "exec")
+            compile(sanitized, "<preflight>", "exec")
         except SyntaxError as e:
             with st.chat_message("assistant"):
                 st.markdown(f"Preflight fehlgeschlagen (SyntaxError): {e}")
@@ -470,7 +511,7 @@ def preflight_and_switch(code_text: str) -> bool:
 
     # Direktes Handover & Render
     try:
-        st.session_state.last_code = code_text
+        st.session_state.last_code = sanitized
         st.session_state._runner_autorun_done = False
         st.session_state.build_completed = True
         st.session_state.refactor_mode = True
@@ -509,23 +550,30 @@ def autorender_now() -> None:
         ns: Dict[str, object] = {"__name__": "__generated__", "st": st}
         if ee is not None:
             ns["ee"] = ee
-        compiled = compile(st.session_state.last_code, "<autorender-now>", "exec")
-        exec(compiled, ns, ns)
 
-        entry = None
-        for fn_name in ("t2e_app", "render", "main"):
-            fn = ns.get(fn_name)
-            if callable(fn):
-                entry = fn
-                break
-        if entry is None:
-            raise RuntimeError("Autorender-now: Kein Entry-Point (t2e_app/render/main) gefunden.")
         try:
-            entry()
-        except TypeError:
-            entry(st)
+            compiled = compile(st.session_state.last_code, "<autorender-now>", "exec")
+            exec(compiled, ns, ns)
 
-    st.session_state._runner_autorun_done = True
+            entry = None
+            for fn_name in ("t2e_app", "render", "main"):
+                fn = ns.get(fn_name)
+                if callable(fn):
+                    entry = fn
+                    break
+            if entry is None:
+                raise RuntimeError("Autorender-now: Kein Entry-Point (t2e_app/render/main) gefunden.")
+            try:
+                entry()
+            except TypeError:
+                entry(st)
+
+            st.session_state._runner_autorun_done = True
+        except BaseException as e:
+            # Sichtbar machen statt still zu scheitern
+            import traceback
+            st.error(f"Autorender fehlgeschlagen: {e.__class__.__name__}: {e}")
+            st.code("".join(traceback.format_exc()))
 
 # ---- Ephemere Vorschläge direkt über dem Eingabefeld -------------------------
 def render_ephemeral_suggestions() -> None:
@@ -566,7 +614,7 @@ with st.sidebar:
     st.caption("Antwortformat: Markdown + Suggestions + JSON (intern) + Code (unsichtbarer Preflight/Handoff).")
     st.divider()
 
-    # Ausführungsmodus (vereinfacht: ohne Fixer/Sanitizer)
+    # Ausführungsmodus (vereinfacht)
     mode_label = "Ausführungsmodus"
     options = ["Direkt ausführen", "Nur Preflight"]
     default_index = 0
@@ -796,5 +844,8 @@ if st.session_state.get("last_code") and not st.session_state.get("_runner_autor
 
         st.session_state._runner_autorun_done = True
         st.sidebar.caption("Runner automatisch gestartet.")
-    except BaseException:
+    except BaseException as e:
+        import traceback
         st.sidebar.warning("Auto-Render fehlgeschlagen – letzter Code konnte nicht ausgeführt werden.")
+        st.error(f"Auto-Render Exception: {e.__class__.__name__}: {e}")
+        st.code("".join(traceback.format_exc()))
